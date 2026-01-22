@@ -77,7 +77,17 @@ Console.CancelKeyPress += (s, e) =>
 // Handle termination signals
 AppDomain.CurrentDomain.ProcessExit += (s, e) =>
 {
-    cts.Cancel();
+    try
+    {
+        if (!cts.IsCancellationRequested)
+        {
+            cts.Cancel();
+        }
+    }
+    catch (ObjectDisposedException)
+    {
+        // Already disposed, ignore
+    }
 };
 
 try
