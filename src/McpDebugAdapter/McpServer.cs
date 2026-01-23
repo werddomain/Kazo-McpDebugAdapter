@@ -179,6 +179,51 @@ public class McpServer
                 Type = "object",
                 Properties = new Dictionary<string, ToolProperty>()
             }
+        },
+        new Tool
+        {
+            Name = "ui_take_screenshot",
+            Description = "Takes a screenshot of the debugged application's main window. Returns a base64-encoded BMP image. Useful for visually inspecting the application state during debugging.",
+            InputSchema = new ToolInputSchema
+            {
+                Type = "object",
+                Properties = new Dictionary<string, ToolProperty>()
+            }
+        },
+        new Tool
+        {
+            Name = "ui_get_controls",
+            Description = "Returns an XML representation of all UI controls in the debugged application's main window. Includes control type, text, position, and hierarchy. Useful for understanding the UI structure and automating interactions.",
+            InputSchema = new ToolInputSchema
+            {
+                Type = "object",
+                Properties = new Dictionary<string, ToolProperty>
+                {
+                    ["maxDepth"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "Maximum depth to traverse the control tree (default: 10)."
+                    }
+                }
+            }
+        },
+        new Tool
+        {
+            Name = "ui_set_process_id",
+            Description = "Manually sets the process ID of the application to inspect for UI operations. Use this if automatic process detection fails.",
+            InputSchema = new ToolInputSchema
+            {
+                Type = "object",
+                Properties = new Dictionary<string, ToolProperty>
+                {
+                    ["processId"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "The process ID (PID) of the application to inspect."
+                    }
+                },
+                Required = ["processId"]
+            }
         }
     ];
 
@@ -332,6 +377,9 @@ public class McpServer
             "debug_get_stack" => await HandleGetStackAsync(cancellationToken),
             "debug_get_variables" => await HandleGetVariablesAsync(cancellationToken),
             "debug_get_status" => HandleGetStatus(),
+            "ui_take_screenshot" => await HandleTakeScreenshotAsync(cancellationToken),
+            "ui_get_controls" => await HandleGetUiControlsAsync(toolParams.Arguments, cancellationToken),
+            "ui_set_process_id" => HandleSetProcessId(toolParams.Arguments),
             _ => CreateErrorResult($"Unknown tool: {toolParams.Name}")
         };
     }
@@ -540,6 +588,75 @@ public class McpServer
 
         var json = JsonSerializer.Serialize(status, new JsonSerializerOptions { WriteIndented = true });
         return CreateResult($"Debug Session Status:\n{json}", false);
+    }
+
+    private async Task<CallToolResult> HandleTakeScreenshotAsync(CancellationToken cancellationToken)
+    {
+        var (success, imageData, message) = await _session.TakeScreenshotAsync();
+
+        if (!success)
+        {
+            return CreateResult(message, true);
+        }
+
+        // Return the image as base64 with a data URI prefix for easy display
+        var output = $"Screenshot captured successfully.\n\nBase64 Image Data (BMP format):\ndata:image/bmp;base64,{imageData}";
+        return CreateResult(output, false);
+    }
+
+    private async Task<CallToolResult> HandleGetUiControlsAsync(Dictionary<string, object>? args, CancellationToken cancellationToken)
+    {
+        var maxDepth = 10;
+
+        if (args != null && args.TryGetValue("maxDepth", out var maxDepthObj))
+        {
+            if (maxDepthObj is JsonElement depthElement)
+            {
+                maxDepth = depthElement.GetInt32();
+            }
+            else if (maxDepthObj is int i)
+            {
+                maxDepth = i;
+            }
+            else if (int.TryParse(maxDepthObj.ToString(), out var parsed))
+            {
+                maxDepth = parsed;
+            }
+        }
+
+        var (success, xml, message) = await _session.GetUiControlsAsync(maxDepth);
+
+        if (!success)
+        {
+            return CreateResult(message, true);
+        }
+
+        return CreateResult($"UI Controls (XML):\n\n{xml}", false);
+    }
+
+    private CallToolResult HandleSetProcessId(Dictionary<string, object>? args)
+    {
+        if (args == null || !args.TryGetValue("processId", out var processIdObj))
+        {
+            return CreateErrorResult("Missing required parameter: processId");
+        }
+
+        int processId;
+        if (processIdObj is JsonElement pidElement)
+        {
+            processId = pidElement.GetInt32();
+        }
+        else if (processIdObj is int i)
+        {
+            processId = i;
+        }
+        else if (!int.TryParse(processIdObj.ToString(), out processId))
+        {
+            return CreateErrorResult("Invalid process ID");
+        }
+
+        _session.SetDebuggedProcessId(processId);
+        return CreateResult($"Target process set to PID {processId}", false);
     }
 
     private object HandleShutdown()

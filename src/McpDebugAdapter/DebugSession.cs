@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using McpDebugAdapter.Dap;
+using McpDebugAdapter.Ui;
 
 namespace McpDebugAdapter;
 
@@ -8,7 +10,9 @@ namespace McpDebugAdapter;
 public class DebugSession
 {
     private readonly DapClient _dapClient;
+    private readonly UiAutomationService _uiService;
     private readonly object _lock = new();
+    private Process? _debuggedProcess;
 
     /// <summary>
     /// The DAP client used for communication with the debugger.
@@ -63,6 +67,7 @@ public class DebugSession
     public DebugSession()
     {
         _dapClient = new DapClient();
+        _uiService = new UiAutomationService();
 
         _dapClient.OnStopped += HandleStopped;
         _dapClient.OnOutput += HandleOutput;
@@ -356,7 +361,7 @@ public class DebugSession
     /// <summary>
     /// Gets the current stack trace.
     /// </summary>
-    public async Task<(bool Success, StackFrame[] Frames, string Message)> GetStackTraceAsync()
+    public async Task<(bool Success, Dap.StackFrame[] Frames, string Message)> GetStackTraceAsync()
     {
         try
         {
@@ -435,6 +440,7 @@ public class DebugSession
                 CurrentThreadId = 0;
                 CurrentFrameId = 0;
                 StopReason = null;
+                _debuggedProcess = null;
             }
 
             return (true, "Debug session stopped.");
@@ -443,6 +449,123 @@ public class DebugSession
         {
             return (false, $"Failed to stop debug session: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Takes a screenshot of the debugged application's main window.
+    /// </summary>
+    /// <returns>Base64-encoded image data.</returns>
+    public async Task<(bool Success, string ImageData, string Message)> TakeScreenshotAsync()
+    {
+        if (!IsActive)
+        {
+            return (false, string.Empty, "No active debug session.");
+        }
+
+        // Try to find the debugged process if not already set
+        if (_debuggedProcess == null)
+        {
+            await TryFindDebuggedProcessAsync();
+        }
+
+        return await _uiService.TakeScreenshotAsync();
+    }
+
+    /// <summary>
+    /// Gets the UI control tree of the debugged application as XML.
+    /// </summary>
+    /// <param name="maxDepth">Maximum depth to traverse the control tree.</param>
+    /// <returns>XML representation of the UI controls.</returns>
+    public async Task<(bool Success, string Xml, string Message)> GetUiControlsAsync(int maxDepth = 10)
+    {
+        if (!IsActive)
+        {
+            return (false, string.Empty, "No active debug session.");
+        }
+
+        // Try to find the debugged process if not already set
+        if (_debuggedProcess == null)
+        {
+            await TryFindDebuggedProcessAsync();
+        }
+
+        return await _uiService.GetControlsAsXmlAsync(maxDepth);
+    }
+
+    /// <summary>
+    /// Sets the process ID of the debugged application for UI automation.
+    /// </summary>
+    public void SetDebuggedProcessId(int processId)
+    {
+        try
+        {
+            _debuggedProcess = Process.GetProcessById(processId);
+            _uiService.SetTargetProcess(_debuggedProcess);
+        }
+        catch (Exception)
+        {
+            _debuggedProcess = null;
+        }
+    }
+
+    /// <summary>
+    /// Tries to find the debugged process by looking for processes started after the debug session began.
+    /// </summary>
+    private async Task TryFindDebuggedProcessAsync()
+    {
+        if (string.IsNullOrEmpty(ProgramPath))
+        {
+            return;
+        }
+
+        try
+        {
+            var programName = Path.GetFileNameWithoutExtension(ProgramPath);
+
+            // Look for processes with matching name
+            var processes = Process.GetProcessesByName(programName);
+            if (processes.Length > 0)
+            {
+                // Use the most recently started one
+                _debuggedProcess = processes.OrderByDescending(p =>
+                {
+                    try { return p.StartTime; }
+                    catch { return DateTime.MinValue; }
+                }).FirstOrDefault();
+
+                if (_debuggedProcess != null)
+                {
+                    _uiService.SetTargetProcess(_debuggedProcess);
+                }
+            }
+
+            // Also try "dotnet" processes that might be running our DLL
+            if (_debuggedProcess == null)
+            {
+                var dotnetProcesses = Process.GetProcessesByName("dotnet");
+                foreach (var proc in dotnetProcesses)
+                {
+                    try
+                    {
+                        // Check if command line contains our program
+                        // This is a heuristic and may not always work
+                        _debuggedProcess = proc;
+                        _uiService.SetTargetProcess(_debuggedProcess);
+                        break;
+                    }
+                    catch
+                    {
+                        // Continue to next process
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Ignore errors in process discovery
+        }
+
+        await Task.CompletedTask;
     }
 
     private void HandleStopped(StoppedEventBody body)

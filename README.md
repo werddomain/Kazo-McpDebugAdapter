@@ -20,6 +20,8 @@ This application acts as a bridge between AI assistants (like Claude) and the .N
 - 📚 **View stack traces** and call chains
 - 📊 **Inspect local variables**
 - 📋 **Monitor session status**
+- 📸 **Take screenshots** of the debugged application
+- 🖼️ **Get UI control tree** as XML representation
 
 ## Prerequisites
 
@@ -160,6 +162,32 @@ Returns the current status of the debug session including:
 - Current thread and frame IDs
 - Stop reason
 - All set breakpoints
+
+### `ui_take_screenshot`
+Takes a screenshot of the debugged application's main window. Returns a base64-encoded BMP image that can be used to visually inspect the application state during debugging.
+
+**Note:** Requires the debugged application to have a visible window.
+
+### `ui_get_controls`
+Returns an XML representation of all UI controls in the debugged application's main window. Useful for understanding the UI structure and automating interactions.
+
+**Parameters:**
+- `maxDepth` (optional): Maximum depth to traverse the control tree (default: 10)
+
+**Example output:**
+```xml
+<?xml version="1.0"?>
+<Window Title="My Application" ClassName="WindowClass" X="100" Y="100" Width="800" Height="600">
+  <Control Type="Button" Text="Click Me" X="10" Y="10" Width="100" Height="30" IsVisible="true" IsEnabled="true"/>
+  <Control Type="TextBox" Text="" X="10" Y="50" Width="200" Height="25" IsVisible="true" IsEnabled="true"/>
+</Window>
+```
+
+### `ui_set_process_id`
+Manually sets the process ID of the application to inspect for UI operations. Use this if automatic process detection fails.
+
+**Parameters:**
+- `processId` (required): The process ID (PID) of the application to inspect
 
 ## Example Usage
 
