@@ -224,6 +224,214 @@ public class McpServer
                 },
                 Required = ["processId"]
             }
+        },
+        new Tool
+        {
+            Name = "ui_click",
+            Description = "Clicks on a control at specific coordinates or by handle. Works with WPF, WinForms, WinUI, and MAUI applications.",
+            InputSchema = new ToolInputSchema
+            {
+                Type = "object",
+                Properties = new Dictionary<string, ToolProperty>
+                {
+                    ["x"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "The X coordinate (screen position) to click."
+                    },
+                    ["y"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "The Y coordinate (screen position) to click."
+                    },
+                    ["handle"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "The window handle of the control to click (alternative to coordinates)."
+                    },
+                    ["button"] = new ToolProperty
+                    {
+                        Type = "string",
+                        Description = "Mouse button to click: 'left' (default), 'right', or 'middle'."
+                    },
+                    ["clickCount"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "Number of clicks (1 for single click, 2 for double click). Default is 1."
+                    }
+                }
+            }
+        },
+        new Tool
+        {
+            Name = "ui_type_text",
+            Description = "Types text into the currently focused control or a specific control. Works with WPF, WinForms, WinUI, and MAUI applications.",
+            InputSchema = new ToolInputSchema
+            {
+                Type = "object",
+                Properties = new Dictionary<string, ToolProperty>
+                {
+                    ["text"] = new ToolProperty
+                    {
+                        Type = "string",
+                        Description = "The text to type."
+                    },
+                    ["handle"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "Optional: The window handle of the control to type into. If not specified, types into the focused control."
+                    }
+                },
+                Required = ["text"]
+            }
+        },
+        new Tool
+        {
+            Name = "ui_send_keys",
+            Description = "Sends keyboard input including special keys and shortcuts. Use {Enter}, {Tab}, {Escape}, {Backspace}, {Delete}, {Up}, {Down}, {Left}, {Right}, {F1}-{F12}. For modifiers: ^ = Ctrl, % = Alt, + = Shift (e.g., '^c' for Ctrl+C, '^s' for Ctrl+S).",
+            InputSchema = new ToolInputSchema
+            {
+                Type = "object",
+                Properties = new Dictionary<string, ToolProperty>
+                {
+                    ["keys"] = new ToolProperty
+                    {
+                        Type = "string",
+                        Description = "The keys to send. Examples: '{Enter}', '{Tab}', '^c' (Ctrl+C), '%{F4}' (Alt+F4)."
+                    }
+                },
+                Required = ["keys"]
+            }
+        },
+        new Tool
+        {
+            Name = "ui_mouse_move",
+            Description = "Moves the mouse cursor to the specified screen coordinates.",
+            InputSchema = new ToolInputSchema
+            {
+                Type = "object",
+                Properties = new Dictionary<string, ToolProperty>
+                {
+                    ["x"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "The X coordinate (screen position)."
+                    },
+                    ["y"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "The Y coordinate (screen position)."
+                    }
+                },
+                Required = ["x", "y"]
+            }
+        },
+        new Tool
+        {
+            Name = "ui_mouse_drag",
+            Description = "Performs a mouse drag operation from one point to another. Useful for drag-and-drop interactions.",
+            InputSchema = new ToolInputSchema
+            {
+                Type = "object",
+                Properties = new Dictionary<string, ToolProperty>
+                {
+                    ["startX"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "The starting X coordinate."
+                    },
+                    ["startY"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "The starting Y coordinate."
+                    },
+                    ["endX"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "The ending X coordinate."
+                    },
+                    ["endY"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "The ending Y coordinate."
+                    },
+                    ["button"] = new ToolProperty
+                    {
+                        Type = "string",
+                        Description = "Mouse button to use: 'left' (default), 'right', or 'middle'."
+                    }
+                },
+                Required = ["startX", "startY", "endX", "endY"]
+            }
+        },
+        new Tool
+        {
+            Name = "ui_mouse_scroll",
+            Description = "Scrolls the mouse wheel at the current or specified position. Positive delta scrolls up, negative scrolls down.",
+            InputSchema = new ToolInputSchema
+            {
+                Type = "object",
+                Properties = new Dictionary<string, ToolProperty>
+                {
+                    ["delta"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "The scroll amount. Positive values scroll up, negative values scroll down."
+                    },
+                    ["x"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "Optional: X coordinate to scroll at."
+                    },
+                    ["y"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "Optional: Y coordinate to scroll at."
+                    }
+                },
+                Required = ["delta"]
+            }
+        },
+        new Tool
+        {
+            Name = "ui_focus_control",
+            Description = "Sets focus to a specific control by its handle. The control will receive keyboard input.",
+            InputSchema = new ToolInputSchema
+            {
+                Type = "object",
+                Properties = new Dictionary<string, ToolProperty>
+                {
+                    ["handle"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "The window handle of the control to focus."
+                    }
+                },
+                Required = ["handle"]
+            }
+        },
+        new Tool
+        {
+            Name = "ui_find_control",
+            Description = "Finds a control by its text content and returns its handle. Useful for locating buttons, labels, or other controls.",
+            InputSchema = new ToolInputSchema
+            {
+                Type = "object",
+                Properties = new Dictionary<string, ToolProperty>
+                {
+                    ["text"] = new ToolProperty
+                    {
+                        Type = "string",
+                        Description = "The text to search for."
+                    },
+                    ["exactMatch"] = new ToolProperty
+                    {
+                        Type = "boolean",
+                        Description = "If true, requires exact text match. If false (default), partial match is allowed."
+                    }
+                },
+                Required = ["text"]
+            }
         }
     ];
 
@@ -380,6 +588,14 @@ public class McpServer
             "ui_take_screenshot" => await HandleTakeScreenshotAsync(cancellationToken),
             "ui_get_controls" => await HandleGetUiControlsAsync(toolParams.Arguments, cancellationToken),
             "ui_set_process_id" => HandleSetProcessId(toolParams.Arguments),
+            "ui_click" => await HandleUiClickAsync(toolParams.Arguments, cancellationToken),
+            "ui_type_text" => await HandleUiTypeTextAsync(toolParams.Arguments, cancellationToken),
+            "ui_send_keys" => await HandleUiSendKeysAsync(toolParams.Arguments, cancellationToken),
+            "ui_mouse_move" => await HandleUiMouseMoveAsync(toolParams.Arguments, cancellationToken),
+            "ui_mouse_drag" => await HandleUiMouseDragAsync(toolParams.Arguments, cancellationToken),
+            "ui_mouse_scroll" => await HandleUiMouseScrollAsync(toolParams.Arguments, cancellationToken),
+            "ui_focus_control" => await HandleUiFocusControlAsync(toolParams.Arguments, cancellationToken),
+            "ui_find_control" => await HandleUiFindControlAsync(toolParams.Arguments, cancellationToken),
             _ => CreateErrorResult($"Unknown tool: {toolParams.Name}")
         };
     }
@@ -657,6 +873,215 @@ public class McpServer
 
         _session.SetDebuggedProcessId(processId);
         return CreateResult($"Target process set to PID {processId}", false);
+    }
+
+    private async Task<CallToolResult> HandleUiClickAsync(Dictionary<string, object>? args, CancellationToken cancellationToken)
+    {
+        // Check if we have a handle to click
+        if (args != null && args.TryGetValue("handle", out var handleObj))
+        {
+            long handle = GetInt64Value(handleObj);
+            var (success, message) = await _session.ClickControlAsync(handle);
+            return CreateResult(message, !success);
+        }
+
+        // Otherwise use coordinates
+        if (args == null || !args.TryGetValue("x", out var xObj) || !args.TryGetValue("y", out var yObj))
+        {
+            return CreateErrorResult("Missing required parameters: x and y coordinates, or handle");
+        }
+
+        int x = GetInt32Value(xObj);
+        int y = GetInt32Value(yObj);
+
+        string button = "left";
+        if (args.TryGetValue("button", out var buttonObj))
+        {
+            button = buttonObj.ToString() ?? "left";
+        }
+
+        int clickCount = 1;
+        if (args.TryGetValue("clickCount", out var clickCountObj))
+        {
+            clickCount = GetInt32Value(clickCountObj);
+        }
+
+        var (clickSuccess, clickMessage) = await _session.ClickAtAsync(x, y, button, clickCount);
+        return CreateResult(clickMessage, !clickSuccess);
+    }
+
+    private async Task<CallToolResult> HandleUiTypeTextAsync(Dictionary<string, object>? args, CancellationToken cancellationToken)
+    {
+        if (args == null || !args.TryGetValue("text", out var textObj))
+        {
+            return CreateErrorResult("Missing required parameter: text");
+        }
+
+        var text = textObj.ToString() ?? string.Empty;
+        long? handle = null;
+
+        if (args.TryGetValue("handle", out var handleObj))
+        {
+            handle = GetInt64Value(handleObj);
+        }
+
+        var (success, message) = await _session.TypeTextAsync(text, handle);
+        return CreateResult(message, !success);
+    }
+
+    private async Task<CallToolResult> HandleUiSendKeysAsync(Dictionary<string, object>? args, CancellationToken cancellationToken)
+    {
+        if (args == null || !args.TryGetValue("keys", out var keysObj))
+        {
+            return CreateErrorResult("Missing required parameter: keys");
+        }
+
+        var keys = keysObj.ToString() ?? string.Empty;
+        var (success, message) = await _session.SendKeysAsync(keys);
+        return CreateResult(message, !success);
+    }
+
+    private async Task<CallToolResult> HandleUiMouseMoveAsync(Dictionary<string, object>? args, CancellationToken cancellationToken)
+    {
+        if (args == null || !args.TryGetValue("x", out var xObj) || !args.TryGetValue("y", out var yObj))
+        {
+            return CreateErrorResult("Missing required parameters: x and y");
+        }
+
+        int x = GetInt32Value(xObj);
+        int y = GetInt32Value(yObj);
+
+        var (success, message) = await _session.MouseMoveAsync(x, y);
+        return CreateResult(message, !success);
+    }
+
+    private async Task<CallToolResult> HandleUiMouseDragAsync(Dictionary<string, object>? args, CancellationToken cancellationToken)
+    {
+        if (args == null ||
+            !args.TryGetValue("startX", out var startXObj) ||
+            !args.TryGetValue("startY", out var startYObj) ||
+            !args.TryGetValue("endX", out var endXObj) ||
+            !args.TryGetValue("endY", out var endYObj))
+        {
+            return CreateErrorResult("Missing required parameters: startX, startY, endX, endY");
+        }
+
+        int startX = GetInt32Value(startXObj);
+        int startY = GetInt32Value(startYObj);
+        int endX = GetInt32Value(endXObj);
+        int endY = GetInt32Value(endYObj);
+
+        string button = "left";
+        if (args.TryGetValue("button", out var buttonObj))
+        {
+            button = buttonObj.ToString() ?? "left";
+        }
+
+        var (success, message) = await _session.MouseDragAsync(startX, startY, endX, endY, button);
+        return CreateResult(message, !success);
+    }
+
+    private async Task<CallToolResult> HandleUiMouseScrollAsync(Dictionary<string, object>? args, CancellationToken cancellationToken)
+    {
+        if (args == null || !args.TryGetValue("delta", out var deltaObj))
+        {
+            return CreateErrorResult("Missing required parameter: delta");
+        }
+
+        int delta = GetInt32Value(deltaObj);
+        int? x = null;
+        int? y = null;
+
+        if (args.TryGetValue("x", out var xObj) && args.TryGetValue("y", out var yObj))
+        {
+            x = GetInt32Value(xObj);
+            y = GetInt32Value(yObj);
+        }
+
+        var (success, message) = await _session.MouseScrollAsync(delta, x, y);
+        return CreateResult(message, !success);
+    }
+
+    private async Task<CallToolResult> HandleUiFocusControlAsync(Dictionary<string, object>? args, CancellationToken cancellationToken)
+    {
+        if (args == null || !args.TryGetValue("handle", out var handleObj))
+        {
+            return CreateErrorResult("Missing required parameter: handle");
+        }
+
+        long handle = GetInt64Value(handleObj);
+        var (success, message) = await _session.FocusControlAsync(handle);
+        return CreateResult(message, !success);
+    }
+
+    private async Task<CallToolResult> HandleUiFindControlAsync(Dictionary<string, object>? args, CancellationToken cancellationToken)
+    {
+        if (args == null || !args.TryGetValue("text", out var textObj))
+        {
+            return CreateErrorResult("Missing required parameter: text");
+        }
+
+        var text = textObj.ToString() ?? string.Empty;
+        bool exactMatch = false;
+
+        if (args.TryGetValue("exactMatch", out var exactMatchObj))
+        {
+            if (exactMatchObj is JsonElement boolElement)
+            {
+                exactMatch = boolElement.GetBoolean();
+            }
+            else if (exactMatchObj is bool b)
+            {
+                exactMatch = b;
+            }
+        }
+
+        var (success, handle, message) = await _session.FindControlByTextAsync(text, exactMatch);
+
+        if (success)
+        {
+            return CreateResult($"Found control with handle: {handle}\n{message}", false);
+        }
+
+        return CreateResult(message, true);
+    }
+
+    private static int GetInt32Value(object obj)
+    {
+        if (obj is JsonElement element)
+        {
+            return element.GetInt32();
+        }
+        else if (obj is int i)
+        {
+            return i;
+        }
+        else if (int.TryParse(obj.ToString(), out var parsed))
+        {
+            return parsed;
+        }
+        return 0;
+    }
+
+    private static long GetInt64Value(object obj)
+    {
+        if (obj is JsonElement element)
+        {
+            return element.GetInt64();
+        }
+        else if (obj is long l)
+        {
+            return l;
+        }
+        else if (obj is int i)
+        {
+            return i;
+        }
+        else if (long.TryParse(obj.ToString(), out var parsed))
+        {
+            return parsed;
+        }
+        return 0;
     }
 
     private object HandleShutdown()

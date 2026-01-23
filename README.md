@@ -22,6 +22,12 @@ This application acts as a bridge between AI assistants (like Claude) and the .N
 - 📋 **Monitor session status**
 - 📸 **Take screenshots** of the debugged application
 - 🖼️ **Get UI control tree** as XML representation
+- 🖱️ **Click controls** - Click at coordinates or by handle
+- ⌨️ **Type text** - Enter text into controls
+- 🎹 **Send keyboard input** - Special keys and shortcuts (Ctrl+C, Enter, Tab, etc.)
+- 🔄 **Mouse operations** - Move, drag, scroll
+- 🎯 **Find controls** - Locate controls by text content
+- ✅ **Compatible with WPF, WinForms, WinUI, and MAUI**
 
 ## Prerequisites
 
@@ -188,6 +194,78 @@ Manually sets the process ID of the application to inspect for UI operations. Us
 
 **Parameters:**
 - `processId` (required): The process ID (PID) of the application to inspect
+
+### `ui_click`
+Clicks on a control at specific coordinates or by handle. Works with WPF, WinForms, WinUI, and MAUI applications.
+
+**Parameters:**
+- `x` (optional): X screen coordinate to click
+- `y` (optional): Y screen coordinate to click
+- `handle` (optional): Window handle of the control to click (alternative to coordinates)
+- `button` (optional): Mouse button - 'left', 'right', or 'middle' (default: 'left')
+- `clickCount` (optional): Number of clicks (default: 1, use 2 for double-click)
+
+### `ui_type_text`
+Types text into the currently focused control or a specific control.
+
+**Parameters:**
+- `text` (required): The text to type
+- `handle` (optional): Window handle of the control to type into
+
+### `ui_send_keys`
+Sends keyboard input including special keys and shortcuts.
+
+**Parameters:**
+- `keys` (required): Keys to send using the format:
+  - Special keys: `{Enter}`, `{Tab}`, `{Escape}`, `{Backspace}`, `{Delete}`, `{Up}`, `{Down}`, `{Left}`, `{Right}`, `{F1}`-`{F12}`
+  - Modifiers: `^` = Ctrl, `%` = Alt, `+` = Shift
+  - Examples: `{Enter}`, `^c` (Ctrl+C), `%{F4}` (Alt+F4), `^+s` (Ctrl+Shift+S)
+
+### `ui_mouse_move`
+Moves the mouse cursor to specified screen coordinates.
+
+**Parameters:**
+- `x` (required): X screen coordinate
+- `y` (required): Y screen coordinate
+
+### `ui_mouse_drag`
+Performs a mouse drag operation from one point to another.
+
+**Parameters:**
+- `startX` (required): Starting X coordinate
+- `startY` (required): Starting Y coordinate
+- `endX` (required): Ending X coordinate
+- `endY` (required): Ending Y coordinate
+- `button` (optional): Mouse button to use (default: 'left')
+
+### `ui_mouse_scroll`
+Scrolls the mouse wheel at the current or specified position.
+
+**Parameters:**
+- `delta` (required): Scroll amount (positive = up, negative = down)
+- `x` (optional): X coordinate to scroll at
+- `y` (optional): Y coordinate to scroll at
+
+### `ui_focus_control`
+Sets focus to a specific control by its handle.
+
+**Parameters:**
+- `handle` (required): Window handle of the control to focus
+
+### `ui_find_control`
+Finds a control by its text content and returns its handle.
+
+**Parameters:**
+- `text` (required): Text to search for
+- `exactMatch` (optional): If true, requires exact match; if false, partial match allowed (default: false)
+
+## Supported UI Frameworks
+
+The UI automation tools are compatible with:
+- **WPF** (Windows Presentation Foundation)
+- **WinForms** (Windows Forms)
+- **WinUI** (Windows UI Library)
+- **MAUI** (Multi-platform App UI) - Windows target
 
 ## Example Usage
 

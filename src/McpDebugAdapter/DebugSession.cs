@@ -508,6 +508,104 @@ public class DebugSession
         }
     }
 
+    #region UI Interaction Methods
+
+    /// <summary>
+    /// Clicks on a control by its handle.
+    /// </summary>
+    public async Task<(bool Success, string Message)> ClickControlAsync(long handle)
+    {
+        await EnsureProcessSetAsync();
+        return await _uiService.ClickControlAsync(new IntPtr(handle));
+    }
+
+    /// <summary>
+    /// Clicks at the specified screen coordinates.
+    /// </summary>
+    public async Task<(bool Success, string Message)> ClickAtAsync(int x, int y, string button = "left", int clickCount = 1)
+    {
+        await EnsureProcessSetAsync();
+        return await _uiService.ClickAtAsync(x, y, button, clickCount);
+    }
+
+    /// <summary>
+    /// Types text into the currently focused control or specified control.
+    /// </summary>
+    public async Task<(bool Success, string Message)> TypeTextAsync(string text, long? handle = null)
+    {
+        await EnsureProcessSetAsync();
+        IntPtr? handlePtr = handle.HasValue ? new IntPtr(handle.Value) : null;
+        return await _uiService.TypeTextAsync(text, handlePtr);
+    }
+
+    /// <summary>
+    /// Sends keyboard keys (including special keys like Enter, Tab, Ctrl+C, etc.).
+    /// </summary>
+    public async Task<(bool Success, string Message)> SendKeysAsync(string keys)
+    {
+        await EnsureProcessSetAsync();
+        return await _uiService.SendKeysAsync(keys);
+    }
+
+    /// <summary>
+    /// Moves the mouse to the specified screen coordinates.
+    /// </summary>
+    public async Task<(bool Success, string Message)> MouseMoveAsync(int x, int y)
+    {
+        await EnsureProcessSetAsync();
+        return await _uiService.MouseMoveAsync(x, y);
+    }
+
+    /// <summary>
+    /// Performs a mouse drag from one point to another.
+    /// </summary>
+    public async Task<(bool Success, string Message)> MouseDragAsync(int startX, int startY, int endX, int endY, string button = "left")
+    {
+        await EnsureProcessSetAsync();
+        return await _uiService.MouseDragAsync(startX, startY, endX, endY, button);
+    }
+
+    /// <summary>
+    /// Sets focus to a control by its handle.
+    /// </summary>
+    public async Task<(bool Success, string Message)> FocusControlAsync(long handle)
+    {
+        await EnsureProcessSetAsync();
+        return await _uiService.FocusControlAsync(new IntPtr(handle));
+    }
+
+    /// <summary>
+    /// Scrolls the mouse wheel at the current or specified position.
+    /// </summary>
+    public async Task<(bool Success, string Message)> MouseScrollAsync(int delta, int? x = null, int? y = null)
+    {
+        await EnsureProcessSetAsync();
+        return await _uiService.MouseScrollAsync(delta, x, y);
+    }
+
+    /// <summary>
+    /// Finds a control by text and returns its handle.
+    /// </summary>
+    public async Task<(bool Success, long Handle, string Message)> FindControlByTextAsync(string text, bool exactMatch = false)
+    {
+        await EnsureProcessSetAsync();
+        var (success, handle, message) = await _uiService.FindControlByTextAsync(text, exactMatch);
+        return (success, handle.ToInt64(), message);
+    }
+
+    /// <summary>
+    /// Ensures the target process is set for UI operations.
+    /// </summary>
+    private async Task EnsureProcessSetAsync()
+    {
+        if (_debuggedProcess == null)
+        {
+            await TryFindDebuggedProcessAsync();
+        }
+    }
+
+    #endregion
+
     /// <summary>
     /// Tries to find the debugged process by looking for processes started after the debug session began.
     /// </summary>
