@@ -9,7 +9,7 @@ namespace McpDebugAdapter;
 public static class DebugLogger
 {
     private static readonly object _lock = new();
-    private static bool _enabled = true;
+    private static bool _enabled = false;  // Disabled by default - requires explicit enablement
     private static TextWriter? _logWriter;
 
     /// <summary>

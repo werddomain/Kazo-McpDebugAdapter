@@ -85,7 +85,10 @@ for (int i = 0; i < args.Length; i++)
     }
 }
 
-// Enable debug logging based on command line or when running in debugger
+// Enable debug logging when:
+// 1. --debug flag is explicitly passed, OR
+// 2. Running under a debugger (e.g., Visual Studio F5 debugging)
+// This allows users to get diagnostics when needed without affecting normal operation
 DebugLogger.Enabled = debugLogging || System.Diagnostics.Debugger.IsAttached;
 
 DebugLogger.Log("=== MCP Debug Adapter Starting ===");
