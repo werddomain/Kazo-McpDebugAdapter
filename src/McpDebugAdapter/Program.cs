@@ -5,6 +5,8 @@
 //
 // Architecture:
 // AI (MCP Client) <==[Stdio / JSON-RPC]==> This App (MCP Server) <==[TCP / DAP]==> netcoredbg
+//          -- OR --
+// AI (MCP Client) <==[TCP / JSON-RPC]==> This App (MCP Server) <==[TCP / DAP]==> netcoredbg
 //
 // CONFIGURATION
 // =============
@@ -38,6 +40,13 @@
 //   }
 // }
 //
+// TCP SERVER MODE
+// ===============
+// Run as a TCP server to allow connections from VS Code or other MCP clients:
+//   dotnet run --project McpDebugAdapter.csproj -- --tcp --port 5085
+// 
+// Then connect from VS Code using: localhost:5085
+//
 // PREREQUISITES
 // =============
 // - .NET 9 SDK installed
@@ -60,16 +69,43 @@
 
 using McpDebugAdapter;
 
+// Parse command line arguments
+var useTcp = args.Contains("--tcp");
+var port = 5085; // Default port
+var debugLogging = args.Contains("--debug");
+
+for (int i = 0; i < args.Length; i++)
+{
+    if (args[i] == "--port" && i + 1 < args.Length)
+    {
+        if (int.TryParse(args[i + 1], out var parsedPort))
+        {
+            port = parsedPort;
+        }
+    }
+}
+
+// Enable debug logging based on command line or when running in debugger
+DebugLogger.Enabled = debugLogging || System.Diagnostics.Debugger.IsAttached;
+
+DebugLogger.Log("=== MCP Debug Adapter Starting ===");
+DebugLogger.Log($"Mode: {(useTcp ? "TCP" : "Stdio")}");
+if (useTcp)
+{
+    DebugLogger.Log($"Port: {port}");
+}
+DebugLogger.Log($"Debug Logging: {DebugLogger.Enabled}");
+DebugLogger.Log($"Process ID: {Environment.ProcessId}");
+
 // Create the debug session (state management)
 var session = new DebugSession();
-
-// Create and start the MCP server
-var server = new McpServer(session);
+DebugLogger.LogDebug("Debug session created");
 
 // Setup cancellation for graceful shutdown
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (s, e) =>
 {
+    DebugLogger.Log("Received Ctrl+C, shutting down...");
     e.Cancel = true;
     cts.Cancel();
 };
@@ -77,6 +113,7 @@ Console.CancelKeyPress += (s, e) =>
 // Handle termination signals
 AppDomain.CurrentDomain.ProcessExit += (s, e) =>
 {
+    DebugLogger.Log("Process exit signal received");
     try
     {
         if (!cts.IsCancellationRequested)
@@ -92,18 +129,37 @@ AppDomain.CurrentDomain.ProcessExit += (s, e) =>
 
 try
 {
-    // Run the MCP server (reads from stdin, writes to stdout)
-    await server.RunAsync(cts.Token);
+    if (useTcp)
+    {
+        // Run as TCP server
+        DebugLogger.Log($"Starting TCP MCP Server on port {port}...");
+        await using var tcpServer = new TcpMcpServer(port, session);
+        await tcpServer.RunAsync(cts.Token);
+    }
+    else
+    {
+        // Run as stdio server (default mode)
+        DebugLogger.Log("Starting Stdio MCP Server...");
+        var server = new McpServer(session);
+        await server.RunAsync(cts.Token);
+    }
 }
 catch (OperationCanceledException)
 {
-    // Normal shutdown
+    DebugLogger.Log("Server shutdown requested");
+}
+catch (Exception ex)
+{
+    DebugLogger.LogError("Fatal error", ex);
+    throw;
 }
 finally
 {
     // Cleanup: stop any active debug session
     if (session.IsActive)
     {
+        DebugLogger.Log("Stopping active debug session...");
         await session.StopAsync();
     }
+    DebugLogger.Log("=== MCP Debug Adapter Stopped ===");
 }

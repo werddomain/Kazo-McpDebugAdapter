@@ -455,6 +455,8 @@ public class McpServer
     /// </summary>
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
+        DebugLogger.Log("MCP Server RunAsync started - waiting for messages...");
+        
         while (!cancellationToken.IsCancellationRequested)
         {
             try
@@ -462,6 +464,7 @@ public class McpServer
                 var line = await _input.ReadLineAsync(cancellationToken);
                 if (line == null)
                 {
+                    DebugLogger.Log("End of input stream detected");
                     break; // End of stream
                 }
 
@@ -470,17 +473,22 @@ public class McpServer
                     continue;
                 }
 
+                DebugLogger.LogJsonRpc("RECV", line);
                 await ProcessMessageAsync(line, cancellationToken);
             }
             catch (OperationCanceledException)
             {
+                DebugLogger.Log("MCP Server operation cancelled");
                 break;
             }
             catch (Exception ex)
             {
+                DebugLogger.LogError("Error processing message", ex);
                 await SendErrorAsync(null, -32603, $"Internal error: {ex.Message}");
             }
         }
+        
+        DebugLogger.Log("MCP Server RunAsync completed");
     }
 
     private async Task ProcessMessageAsync(string message, CancellationToken cancellationToken)
@@ -490,10 +498,12 @@ public class McpServer
             var request = JsonSerializer.Deserialize<JsonRpcRequest>(message);
             if (request == null)
             {
+                DebugLogger.LogWarning("Received invalid JSON-RPC request (null after deserialization)");
                 await SendErrorAsync(null, -32600, "Invalid Request");
                 return;
             }
 
+            DebugLogger.LogDebug($"Processing request: method={request.Method}, id={request.Id}");
             var result = await HandleRequestAsync(request, cancellationToken);
 
             if (request.Id != null)
@@ -501,18 +511,22 @@ public class McpServer
                 await SendResponseAsync(request.Id, result);
             }
         }
-        catch (JsonException)
+        catch (JsonException ex)
         {
+            DebugLogger.LogError("JSON parse error", ex);
             await SendErrorAsync(null, -32700, "Parse error");
         }
         catch (Exception ex)
         {
+            DebugLogger.LogError("Error handling request", ex);
             await SendErrorAsync(null, -32603, $"Internal error: {ex.Message}");
         }
     }
 
     private async Task<object?> HandleRequestAsync(JsonRpcRequest request, CancellationToken cancellationToken)
     {
+        DebugLogger.LogDebug($"Handling method: {request.Method}");
+        
         return request.Method switch
         {
             "initialize" => HandleInitialize(request.Params),
@@ -527,7 +541,9 @@ public class McpServer
 
     private object HandleInitialize(object? @params)
     {
-        return new InitializeResult
+        DebugLogger.Log("MCP Initialize request received");
+        
+        var result = new InitializeResult
         {
             ProtocolVersion = "2024-11-05",
             Capabilities = new ServerCapabilities
@@ -541,16 +557,21 @@ public class McpServer
                 Version = "1.0.0"
             }
         };
+        
+        DebugLogger.Log($"MCP Initialize response: protocol={result.ProtocolVersion}, server={result.ServerInfo.Name} v{result.ServerInfo.Version}");
+        return result;
     }
 
     private object? HandleInitialized()
     {
         // Client has acknowledged initialization
+        DebugLogger.Log("MCP Initialized notification received - client ready");
         return null;
     }
 
     private object HandleToolsList()
     {
+        DebugLogger.LogDebug($"Tools list requested - returning {AvailableTools.Length} tools");
         return new ListToolsResult { Tools = AvailableTools };
     }
 
@@ -558,6 +579,7 @@ public class McpServer
     {
         if (@params == null)
         {
+            DebugLogger.LogWarning("tools/call called with missing parameters");
             return CreateErrorResult("Missing parameters");
         }
 
@@ -574,10 +596,17 @@ public class McpServer
 
         if (toolParams == null)
         {
+            DebugLogger.LogWarning("tools/call called with invalid tool parameters");
             return CreateErrorResult("Invalid tool parameters");
         }
 
-        return toolParams.Name switch
+        DebugLogger.Log($"Tool call: {toolParams.Name}");
+        if (toolParams.Arguments != null && toolParams.Arguments.Count > 0)
+        {
+            DebugLogger.LogDebug($"Tool arguments: {JsonSerializer.Serialize(toolParams.Arguments)}");
+        }
+
+        var result = toolParams.Name switch
         {
             "debug_launch" => await HandleDebugLaunchAsync(toolParams.Arguments, cancellationToken),
             "debug_stop" => await HandleDebugStopAsync(cancellationToken),
@@ -603,6 +632,9 @@ public class McpServer
             "ui_find_control" => await HandleUiFindControlAsync(toolParams.Arguments, cancellationToken),
             _ => CreateErrorResult($"Unknown tool: {toolParams.Name}")
         };
+
+        DebugLogger.LogDebug($"Tool {toolParams.Name} completed - isError={result.IsError}");
+        return result;
     }
 
     private async Task<CallToolResult> HandleDebugLaunchAsync(Dictionary<string, object>? args, CancellationToken cancellationToken)
@@ -1108,6 +1140,7 @@ public class McpServer
     private object HandleShutdown()
     {
         // Cleanup and return acknowledgment
+        DebugLogger.Log("MCP Shutdown request received");
         return new { };
     }
 
@@ -1115,6 +1148,7 @@ public class McpServer
     {
         // Could send notifications to the client here
         // For now, we just log or store them for retrieval via debug_get_status
+        DebugLogger.LogDebug($"Debug event: {eventName}");
     }
 
     private async Task SendResponseAsync(object id, object? result)
@@ -1130,12 +1164,15 @@ public class McpServer
             DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
         });
 
+        DebugLogger.LogJsonRpc("SEND", json);
         await _output.WriteLineAsync(json);
         await _output.FlushAsync();
     }
 
     private async Task SendErrorAsync(object? id, int code, string message)
     {
+        DebugLogger.LogError($"Sending error response: code={code}, message={message}");
+        
         var response = new JsonRpcResponse
         {
             Id = id,
@@ -1147,6 +1184,7 @@ public class McpServer
         };
 
         var json = JsonSerializer.Serialize(response);
+        DebugLogger.LogJsonRpc("SEND", json);
         await _output.WriteLineAsync(json);
         await _output.FlushAsync();
     }
