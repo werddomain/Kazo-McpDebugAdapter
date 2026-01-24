@@ -78,12 +78,12 @@ public class DebugSession
     /// <summary>
     /// Starts a new debug session.
     /// </summary>
-    /// <param name="dllPath">Path to the DLL to debug.</param>
+    /// <param name="programPath">Path to the program (DLL or EXE) to debug.</param>
     /// <param name="args">Command line arguments for the program.</param>
     /// <param name="stopAtEntry">Whether to stop at entry point.</param>
     /// <param name="netcoredbgPath">Path to netcoredbg executable.</param>
     public async Task<(bool Success, string Message)> LaunchAsync(
-        string dllPath,
+        string programPath,
         string[]? args = null,
         bool stopAtEntry = false,
         string? netcoredbgPath = null)
@@ -95,9 +95,9 @@ public class DebugSession
                 return (false, "A debug session is already active. Stop it first.");
             }
 
-            if (!File.Exists(dllPath))
+            if (!File.Exists(programPath))
             {
-                return (false, $"File not found: {dllPath}");
+                return (false, $"File not found: {programPath}");
             }
 
             if (!string.IsNullOrEmpty(netcoredbgPath))
@@ -116,7 +116,7 @@ public class DebugSession
             }
 
             // Launch
-            var launched = await _dapClient.LaunchAsync(dllPath, args, Path.GetDirectoryName(dllPath), stopAtEntry);
+            var launched = await _dapClient.LaunchAsync(programPath, args, Path.GetDirectoryName(programPath), stopAtEntry);
             if (!launched)
             {
                 return (false, "Failed to launch program.");
@@ -135,10 +135,10 @@ public class DebugSession
             {
                 IsActive = true;
                 IsPaused = stopAtEntry;
-                ProgramPath = dllPath;
+                ProgramPath = programPath;
             }
 
-            return (true, $"Debug session started for {Path.GetFileName(dllPath)}");
+            return (true, $"Debug session started for {Path.GetFileName(programPath)}");
         }
         catch (Exception ex)
         {
