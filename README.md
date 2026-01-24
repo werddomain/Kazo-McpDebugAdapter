@@ -173,7 +173,38 @@ Then configure VS Code to connect to the running server:
 }
 ```
 
-**Benefits of TCP mode:**
+Or use it with httpL
+```json
+{
+	"servers": {
+		"dotnet-debugger": {
+			"url": "http://localhost:5085",
+			"type": "http"
+		}
+	},
+	"inputs": []
+}
+```
+
+**Exemple de prompt** :
+
+> Try to run dotnet-debugger to debug the exe of KazoVault.Ui.exe
+> 
+> ```JSON
+> {
+>   "method": "debug_launch",
+>   "params": {
+>     "programPath": "C:\\...\\KazoVault.UI.exe",
+>     "useVsDbg": true,
+>     "useLaunchThenAttach": true,
+>     "stopAtEntry": true
+>   }
+> }
+> ```
+> 
+> met un breakpoint sur 'KillSwitch_Activated' dans #file:MainWindow.xaml.cs puis clique sur le button 'KillSwitchBtn' avec l'automationId='KillSwitchButton'
+
+**Benefits of TCP/HTTP modes:**
 - Run the MCP server in Visual Studio with debugger attached
 - See all debug logs in Visual Studio's Output window
 - Intercept and debug potential errors in the MCP server itself
