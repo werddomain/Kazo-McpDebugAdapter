@@ -50,12 +50,30 @@
 // PREREQUISITES
 // =============
 // - .NET 9 SDK installed
-// - netcoredbg installed and available in PATH
-//   (Install via: dotnet tool install -g netcoredbg or from https://github.com/Samsung/netcoredbg)
+// - vsdbg (recommended for .NET 10+ support) or netcoredbg installed
+//   vsdbg: Usually comes with VS Code C# extension
+//   netcoredbg: Install via: dotnet tool install -g netcoredbg or from https://github.com/Samsung/netcoredbg
+//
+// DEBUGGING MODES
+// ===============
+// 1. Direct Launch (default): Launches program directly with debugger attached
+//    - Fastest startup
+//    - Good for most scenarios
+// 
+// 2. Launch-then-Attach: Launches program first, then attaches debugger
+//    - More reliable for complex applications
+//    - Better compatibility with .NET 10+
+//    - Use: debug_launch(..., useLaunchThenAttach: true)
+//
+// 3. Attach to Existing Process: Attach to already running .NET process
+//    - Use: debug_attach(processId: 1234) or debug_attach(processName: "MyApp")
+//    - List processes with: debug_list_processes()
 //
 // AVAILABLE TOOLS
 // ===============
-// - debug_launch(programPath, args?, stopAtEntry?) - Start debugging a .NET program (DLL or EXE)
+// - debug_launch(programPath, args?, stopAtEntry?, useVsDbg?, useLaunchThenAttach?) - Start debugging a .NET program (DLL or EXE) with enhanced options
+// - debug_attach(processId?, processName?) - Attach to an existing .NET process
+// - debug_list_processes(filter?) - List available .NET processes for debugging
 // - debug_stop() - Stop the debug session
 // - debug_set_breakpoint(file, line) - Set a breakpoint
 // - debug_remove_breakpoint(file, line) - Remove a breakpoint
@@ -100,9 +118,9 @@ if (useTcp)
 DebugLogger.Log($"Debug Logging: {DebugLogger.Enabled}");
 DebugLogger.Log($"Process ID: {Environment.ProcessId}");
 
-// Create the debug session (state management)
-var session = new DebugSession();
-DebugLogger.LogDebug("Debug session created");
+// Create the enhanced debug session (state management with advanced features)
+var session = new EnhancedDebugSession();
+DebugLogger.LogDebug("Enhanced debug session created with vsdbg and attach support");
 
 // Setup cancellation for graceful shutdown
 using var cts = new CancellationTokenSource();

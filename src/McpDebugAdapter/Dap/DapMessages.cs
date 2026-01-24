@@ -164,6 +164,32 @@ public class LaunchRequestArguments
 
 #endregion
 
+#region Attach Request
+
+public class AttachRequestArguments
+{
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = ".NET Core Attach";
+
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = "coreclr";
+
+    [JsonPropertyName("request")]
+    public string Request { get; set; } = "attach";
+
+    [JsonPropertyName("processId")]
+    public int ProcessId { get; set; }
+
+    [JsonPropertyName("program")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Program { get; set; }
+
+    [JsonPropertyName("justMyCode")]
+    public bool JustMyCode { get; set; } = true;
+}
+
+#endregion
+
 #region Breakpoints
 
 public class SetBreakpointsArguments

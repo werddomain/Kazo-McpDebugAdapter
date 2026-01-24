@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "McpDebugAdapter": {
+      "commandName": "Project",
+      "commandLineArgs": "--tcp --debug"
+    }
+  }
+}

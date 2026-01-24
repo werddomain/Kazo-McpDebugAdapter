@@ -10,7 +10,7 @@ namespace McpDebugAdapter;
 public class TcpMcpServer : IAsyncDisposable
 {
     private readonly int _port;
-    private readonly DebugSession _session;
+    private readonly EnhancedDebugSession _session;
     private TcpListener? _listener;
     private readonly List<TcpClient> _clients = [];
     private readonly object _lock = new();
@@ -20,7 +20,7 @@ public class TcpMcpServer : IAsyncDisposable
     /// </summary>
     /// <param name="port">The port to listen on (e.g., 5085).</param>
     /// <param name="session">The debug session to use.</param>
-    public TcpMcpServer(int port, DebugSession session)
+    public TcpMcpServer(int port, EnhancedDebugSession session)
     {
         _port = port;
         _session = session;
@@ -91,8 +91,8 @@ public class TcpMcpServer : IAsyncDisposable
 
             DebugLogger.Log($"Starting MCP session for client {endpoint}");
 
-            // Create an MCP server instance for this client
-            var mcpServer = new McpServer(_session, writer, reader);
+            // Create an MCP server instance for this client with HTTP wrapper enabled
+            var mcpServer = new McpServer(_session, writer, reader, useHttpWrapper: true);
             
             // Run the MCP server for this client
             await mcpServer.RunAsync(cancellationToken);

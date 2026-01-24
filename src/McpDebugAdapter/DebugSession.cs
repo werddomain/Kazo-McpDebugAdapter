@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 using McpDebugAdapter.Dap;
 using McpDebugAdapter.Ui;
 
@@ -100,36 +101,70 @@ public class DebugSession
                 return (false, $"File not found: {programPath}");
             }
 
+            // Check .NET version compatibility
+            var targetFramework = GetTargetFramework(programPath);
+            if (!string.IsNullOrEmpty(targetFramework))
+            {
+                DebugLogger.Log($"Target framework: {targetFramework}");
+                if (targetFramework.StartsWith("net10.") || targetFramework.StartsWith("net1"))
+                {
+                    var warningMsg = "WARNING: Debugging .NET 10+ applications may not be fully supported with netcoredbg 3.x. " +
+                                   "If you experience issues, consider:\\n" +
+                                   "1. Using a newer version of netcoredbg\\n" +
+                                   "2. Building your application with an earlier .NET version (like net8.0 or net9.0)\\n" +
+                                   "3. Using Visual Studio or Visual Studio Code's built-in debugger for .NET 10+ apps";
+                    DebugLogger.LogWarning(warningMsg);
+                    
+                    // For now, we'll still attempt debugging but with clear warnings
+                }
+            }
+
+            DebugLogger.Log($"Starting debug session for: {programPath}");
+            DebugLogger.Log($"Arguments: {(args != null ? string.Join(" ", args) : "(none)")}");
+            DebugLogger.Log($"Stop at entry: {stopAtEntry}");
+            
             if (!string.IsNullOrEmpty(netcoredbgPath))
             {
                 _dapClient.NetCoreDbgPath = netcoredbgPath;
             }
 
+            // Use CancellationTokenSource with timeout for better control
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+            var cancellationToken = timeoutCts.Token;
+
             // Start the DAP client
-            await _dapClient.StartAsync();
+            DebugLogger.LogDebug("Starting DAP client...");
+            await _dapClient.StartAsync(cancellationToken: cancellationToken);
 
             // Initialize
-            var capabilities = await _dapClient.InitializeAsync();
+            DebugLogger.LogDebug("Initializing debugger...");
+            var capabilities = await _dapClient.InitializeAsync(cancellationToken);
             if (capabilities == null)
             {
-                return (false, "Failed to initialize debugger.");
+                return (false, "Failed to initialize debugger - no capabilities returned.");
             }
 
             // Launch
-            var launched = await _dapClient.LaunchAsync(programPath, args, Path.GetDirectoryName(programPath), stopAtEntry);
+            DebugLogger.LogDebug($"Launching program: {programPath}");
+            var launched = await _dapClient.LaunchAsync(programPath, args, Path.GetDirectoryName(programPath), stopAtEntry, cancellationToken);
             if (!launched)
             {
-                return (false, "Failed to launch program.");
+                return (false, "Failed to launch program - launch request failed.");
             }
 
             // Set any pending breakpoints
-            foreach (var (file, lines) in Breakpoints)
+            if (Breakpoints.Any())
             {
-                await _dapClient.SetBreakpointsAsync(file, [.. lines]);
+                DebugLogger.LogDebug($"Setting {Breakpoints.Sum(bp => bp.Value.Count)} pending breakpoints...");
+                foreach (var (file, lines) in Breakpoints)
+                {
+                    await _dapClient.SetBreakpointsAsync(file, [.. lines], cancellationToken);
+                }
             }
 
             // Configuration done
-            await _dapClient.ConfigurationDoneAsync();
+            DebugLogger.LogDebug("Sending configuration done...");
+            await _dapClient.ConfigurationDoneAsync(cancellationToken);
 
             lock (_lock)
             {
@@ -138,11 +173,55 @@ public class DebugSession
                 ProgramPath = programPath;
             }
 
-            return (true, $"Debug session started for {Path.GetFileName(programPath)}");
+            var message = $"Debug session started for {Path.GetFileName(programPath)}";
+            DebugLogger.Log(message);
+            return (true, message);
+        }
+        catch (OperationCanceledException)
+        {
+            var errorMsg = "Debug session launch was cancelled (timeout or cancellation)";
+            DebugLogger.LogError(errorMsg);
+            return (false, errorMsg);
         }
         catch (Exception ex)
         {
-            return (false, $"Failed to start debug session: {ex.Message}");
+            var errorMsg = $"Failed to start debug session: {ex.Message}";
+            DebugLogger.LogError(errorMsg, ex);
+            return (false, errorMsg);
+        }
+    }
+
+    private string? GetTargetFramework(string programPath)
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(programPath);
+            if (string.IsNullOrEmpty(directory))
+                return null;
+
+            // Look for .deps.json file which contains target framework info
+            var depsJsonFile = Path.ChangeExtension(programPath, ".deps.json");
+            if (File.Exists(depsJsonFile))
+            {
+                var depsContent = File.ReadAllText(depsJsonFile);
+                using var depsJson = JsonDocument.Parse(depsContent);
+                
+                if (depsJson.RootElement.TryGetProperty("targets", out var targets))
+                {
+                    var firstTarget = targets.EnumerateObject().FirstOrDefault();
+                    return firstTarget.Name;
+                }
+            }
+
+            // Fallback: try to infer from directory name
+            var parts = directory.Split(Path.DirectorySeparatorChar);
+            var netFrameworkPart = parts.FirstOrDefault(p => p.StartsWith("net"));
+            return netFrameworkPart;
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.LogDebug($"Could not determine target framework: {ex.Message}");
+            return null;
         }
     }
 
@@ -664,6 +743,22 @@ public class DebugSession
         }
 
         await Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Updates the session state - used by EnhancedDebugSession for VsDbg integration.
+    /// </summary>
+    internal void UpdateSessionState(bool isActive, string? programPath = null, bool isPaused = false)
+    {
+        lock (_lock)
+        {
+            IsActive = isActive;
+            if (programPath != null)
+            {
+                ProgramPath = programPath;
+            }
+            IsPaused = isPaused;
+        }
     }
 
     private void HandleStopped(StoppedEventBody body)

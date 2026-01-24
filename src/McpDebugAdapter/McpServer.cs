@@ -11,16 +11,17 @@ namespace McpDebugAdapter;
 /// </summary>
 public class McpServer
 {
-    private readonly DebugSession _session;
+    private readonly EnhancedDebugSession _session;
     private readonly TextWriter _output;
     private readonly TextReader _input;
+    private readonly bool _useHttpWrapper;
 
     private static readonly Tool[] AvailableTools =
     [
         new Tool
         {
             Name = "debug_launch",
-            Description = "Starts a new debug session for a .NET application. This launches netcoredbg and attaches it to the specified program (DLL or EXE).",
+            Description = "Starts a new debug session for a .NET application. Supports multiple debugging approaches for better .NET 10+ compatibility.",
             InputSchema = new ToolInputSchema
             {
                 Type = "object",
@@ -46,6 +47,57 @@ public class McpServer
                     {
                         Type = "boolean",
                         Description = "If true, the debugger will pause at the entry point of the program."
+                    },
+                    ["useVsDbg"] = new ToolProperty
+                    {
+                        Type = "boolean", 
+                        Description = "Use vsdbg instead of netcoredbg for better .NET 10+ support. Default: true"
+                    },
+                    ["useLaunchThenAttach"] = new ToolProperty
+                    {
+                        Type = "boolean",
+                        Description = "Launch the process first, then attach the debugger. More reliable for some scenarios. Default: false"
+                    }
+                },
+                Required = []
+            }
+        },
+        new Tool
+        {
+            Name = "debug_attach",
+            Description = "Attaches the debugger to an existing .NET process by process ID or name.",
+            InputSchema = new ToolInputSchema
+            {
+                Type = "object",
+                Properties = new Dictionary<string, ToolProperty>
+                {
+                    ["processId"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "The process ID (PID) to attach to."
+                    },
+                    ["processName"] = new ToolProperty
+                    {
+                        Type = "string",
+                        Description = "The process name to search for and attach to."
+                    }
+                },
+                Required = []
+            }
+        },
+        new Tool
+        {
+            Name = "debug_list_processes",
+            Description = "Lists available .NET processes that can be debugged.",
+            InputSchema = new ToolInputSchema
+            {
+                Type = "object",
+                Properties = new Dictionary<string, ToolProperty>
+                {
+                    ["filter"] = new ToolProperty
+                    {
+                        Type = "string",
+                        Description = "Optional filter to search for specific process names."
                     }
                 },
                 Required = []
@@ -440,23 +492,110 @@ public class McpServer
         }
     ];
 
-    public McpServer(DebugSession session, TextWriter? output = null, TextReader? input = null)
+    public McpServer(EnhancedDebugSession session, TextWriter? output = null, TextReader? input = null, bool useHttpWrapper = false)
     {
         _session = session;
         _output = output ?? Console.Out;
         _input = input ?? Console.In;
+        _useHttpWrapper = useHttpWrapper;
 
         // Subscribe to debug events to potentially send notifications
         _session.OnDebugEvent += HandleDebugEvent;
     }
 
     /// <summary>
-    /// Starts the MCP server and begins processing messages from stdin.
+    /// Starts the MCP server and begins processing messages from stdin or HTTP.
     /// </summary>
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
         DebugLogger.Log("MCP Server RunAsync started - waiting for messages...");
         
+        if (_useHttpWrapper)
+        {
+            await RunHttpModeAsync(cancellationToken);
+        }
+        else
+        {
+            await RunStdioModeAsync(cancellationToken);
+        }
+        
+        DebugLogger.Log("MCP Server RunAsync completed");
+    }
+
+    private async Task RunHttpModeAsync(CancellationToken cancellationToken)
+    {
+        var reader = _input as StreamReader;
+        var writer = _output as StreamWriter;
+
+        if (reader == null || writer == null)
+        {
+            throw new InvalidOperationException("HTTP mode requires StreamReader/StreamWriter");
+        }
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                // Read HTTP request and extract JSON-RPC message
+                var jsonRpcMessage = await HttpJsonRpcHandler.ReadHttpRequestAsync(reader);
+                
+                if (jsonRpcMessage == null)
+                {
+                    // Invalid or non-POST request, close connection
+                    break;
+                }
+
+                if (string.IsNullOrWhiteSpace(jsonRpcMessage))
+                {
+                    // Handle OPTIONS request for CORS
+                    await HttpJsonRpcHandler.SendOptionsResponseAsync(writer);
+                    continue;
+                }
+
+                DebugLogger.LogJsonRpc("RECV", jsonRpcMessage);
+                
+                // Process the JSON-RPC message
+                var response = await ProcessMessageForResponseAsync(jsonRpcMessage, cancellationToken);
+                
+                if (!string.IsNullOrEmpty(response))
+                {
+                    DebugLogger.LogJsonRpc("SEND", response);
+                    await HttpJsonRpcHandler.SendHttpResponseAsync(writer, response);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                DebugLogger.Log("MCP Server HTTP mode cancelled");
+                break;
+            }
+            catch (Exception ex)
+            {
+                DebugLogger.LogError("Error processing HTTP message", ex);
+                try
+                {
+                    var errorResponse = JsonSerializer.Serialize(new JsonRpcResponse
+                    {
+                        JsonRpc = "2.0",
+                        Id = null,
+                        Error = new JsonRpcError
+                        {
+                            Code = -32603,
+                            Message = $"Internal error: {ex.Message}"
+                        }
+                    });
+                    await HttpJsonRpcHandler.SendHttpResponseAsync(writer, errorResponse);
+                }
+                catch
+                {
+                    // If we can't send error response, break the connection
+                    break;
+                }
+            }
+        }
+    }
+
+    private async Task RunStdioModeAsync(CancellationToken cancellationToken)
+    {
         while (!cancellationToken.IsCancellationRequested)
         {
             try
@@ -487,8 +626,6 @@ public class McpServer
                 await SendErrorAsync(null, -32603, $"Internal error: {ex.Message}");
             }
         }
-        
-        DebugLogger.Log("MCP Server RunAsync completed");
     }
 
     private async Task ProcessMessageAsync(string message, CancellationToken cancellationToken)
@@ -523,6 +660,72 @@ public class McpServer
         }
     }
 
+    private async Task<string?> ProcessMessageForResponseAsync(string message, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var request = JsonSerializer.Deserialize<JsonRpcRequest>(message);
+            if (request == null)
+            {
+                DebugLogger.LogWarning("Received invalid JSON-RPC request (null after deserialization)");
+                return JsonSerializer.Serialize(new JsonRpcResponse
+                {
+                    JsonRpc = "2.0",
+                    Id = null,
+                    Error = new JsonRpcError
+                    {
+                        Code = -32600,
+                        Message = "Invalid Request"
+                    }
+                });
+            }
+
+            DebugLogger.LogDebug($"Processing request: method={request.Method}, id={request.Id}");
+            var result = await HandleRequestAsync(request, cancellationToken);
+
+            if (request.Id != null)
+            {
+                return JsonSerializer.Serialize(new JsonRpcResponse
+                {
+                    JsonRpc = "2.0",
+                    Id = request.Id,
+                    Result = result
+                });
+            }
+            
+            // Notifications don't get responses
+            return null;
+        }
+        catch (JsonException ex)
+        {
+            DebugLogger.LogError("JSON parse error", ex);
+            return JsonSerializer.Serialize(new JsonRpcResponse
+            {
+                JsonRpc = "2.0",
+                Id = null,
+                Error = new JsonRpcError
+                {
+                    Code = -32700,
+                    Message = "Parse error"
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.LogError("Error handling request", ex);
+            return JsonSerializer.Serialize(new JsonRpcResponse
+            {
+                JsonRpc = "2.0",
+                Id = null,
+                Error = new JsonRpcError
+                {
+                    Code = -32603,
+                    Message = $"Internal error: {ex.Message}"
+                }
+            });
+        }
+    }
+
     private async Task<object?> HandleRequestAsync(JsonRpcRequest request, CancellationToken cancellationToken)
     {
         DebugLogger.LogDebug($"Handling method: {request.Method}");
@@ -531,6 +734,8 @@ public class McpServer
         {
             "initialize" => HandleInitialize(request.Params),
             "initialized" => HandleInitialized(),
+            "notifications/initialized" => HandleNotificationsInitialized(),
+            "logging/setLevel" => HandleLoggingSetLevel(request.Params),
             "tools/list" => HandleToolsList(),
             "tools/call" => await HandleToolsCallAsync(request.Params, cancellationToken),
             "ping" => new { },
@@ -567,6 +772,35 @@ public class McpServer
         // Client has acknowledged initialization
         DebugLogger.Log("MCP Initialized notification received - client ready");
         return null;
+    }
+
+    private object? HandleNotificationsInitialized()
+    {
+        // Client has sent notifications/initialized
+        DebugLogger.Log("MCP notifications/initialized received - client ready for notifications");
+        return null;
+    }
+
+    private object HandleLoggingSetLevel(object? @params)
+    {
+        // Client is setting log level
+        DebugLogger.Log("MCP logging/setLevel received");
+        if (@params != null)
+        {
+            try
+            {
+                var logLevelParams = JsonSerializer.Deserialize<Dictionary<string, object>>(@params.ToString() ?? "{}");
+                if (logLevelParams?.ContainsKey("level") == true)
+                {
+                    DebugLogger.Log($"Log level set to: {logLevelParams["level"]}");
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLogger.LogDebug($"Could not parse log level params: {ex.Message}");
+            }
+        }
+        return new { };
     }
 
     private object HandleToolsList()
@@ -609,6 +843,8 @@ public class McpServer
         var result = toolParams.Name switch
         {
             "debug_launch" => await HandleDebugLaunchAsync(toolParams.Arguments, cancellationToken),
+            "debug_attach" => await HandleDebugAttachAsync(toolParams.Arguments, cancellationToken),
+            "debug_list_processes" => HandleListProcessesAsync(toolParams.Arguments),
             "debug_stop" => await HandleDebugStopAsync(cancellationToken),
             "debug_set_breakpoint" => await HandleSetBreakpointAsync(toolParams.Arguments, cancellationToken),
             "debug_remove_breakpoint" => await HandleRemoveBreakpointAsync(toolParams.Arguments, cancellationToken),
@@ -663,6 +899,8 @@ public class McpServer
 
         string[]? programArgs = null;
         var stopAtEntry = false;
+        var useVsDbg = true; // Default to vsdbg for better .NET 10+ support
+        var useLaunchThenAttach = false;
 
         if (args.TryGetValue("args", out var argsObj) && argsObj is JsonElement argsElement)
         {
@@ -683,8 +921,101 @@ public class McpServer
             }
         }
 
-        var (success, message) = await _session.LaunchAsync(programPath, programArgs, stopAtEntry);
+        if (args.TryGetValue("useVsDbg", out var useVsDbgObj))
+        {
+            if (useVsDbgObj is JsonElement boolElement)
+            {
+                useVsDbg = boolElement.GetBoolean();
+            }
+            else if (useVsDbgObj is bool b)
+            {
+                useVsDbg = b;
+            }
+        }
+
+        if (args.TryGetValue("useLaunchThenAttach", out var launchThenAttachObj))
+        {
+            if (launchThenAttachObj is JsonElement boolElement)
+            {
+                useLaunchThenAttach = boolElement.GetBoolean();
+            }
+            else if (launchThenAttachObj is bool b)
+            {
+                useLaunchThenAttach = b;
+            }
+        }
+
+        // Use enhanced session features
+        var (success, message) = await _session.LaunchEnhancedAsync(programPath, programArgs, stopAtEntry, useVsDbg, useLaunchThenAttach);
         return CreateResult(message, !success);
+    }
+
+    private async Task<CallToolResult> HandleDebugAttachAsync(Dictionary<string, object>? args, CancellationToken cancellationToken)
+    {
+        int? processId = null;
+        string? processName = null;
+
+        if (args?.TryGetValue("processId", out var processIdObj) == true)
+        {
+            if (processIdObj is JsonElement intElement)
+            {
+                processId = intElement.GetInt32();
+            }
+            else if (processIdObj is int i)
+            {
+                processId = i;
+            }
+            else if (int.TryParse(processIdObj.ToString(), out var parsed))
+            {
+                processId = parsed;
+            }
+        }
+
+        if (args?.TryGetValue("processName", out var processNameObj) == true)
+        {
+            processName = processNameObj.ToString();
+        }
+
+        if (!processId.HasValue && string.IsNullOrEmpty(processName))
+        {
+            return CreateErrorResult("Either processId or processName must be specified.");
+        }
+
+        var (success, message) = await _session.AttachToProcessAsync(processName, processId);
+        return CreateResult(message, !success);
+    }
+
+    private CallToolResult HandleListProcessesAsync(Dictionary<string, object>? args)
+    {
+        string? filter = null;
+        if (args?.TryGetValue("filter", out var filterObj) == true)
+        {
+            filter = filterObj.ToString();
+        }
+
+        var (success, processes, message) = _session.ListDebuggableProcesses(filter);
+        
+        if (!success)
+        {
+            return CreateErrorResult(message);
+        }
+
+        var processInfo = processes.Select(p => new
+        {
+            id = p.Id,
+            name = p.Name,
+            title = p.MainWindowTitle,
+            startTime = p.StartTime.ToString("yyyy-MM-dd HH:mm:ss"),
+            hasExited = p.HasExited
+        }).ToList();
+
+        var fullMessage = message;
+        if (processes.Any())
+        {
+            fullMessage += ":\n" + string.Join("\n", processes.Select(p => $"  {p}"));
+        }
+
+        return CreateResult(fullMessage, false);
     }
 
     private async Task<CallToolResult> HandleDebugStopAsync(CancellationToken cancellationToken)

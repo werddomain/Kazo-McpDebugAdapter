@@ -87,6 +87,7 @@ public class DapClient : IAsyncDisposable
         {
             if (!string.IsNullOrEmpty(e.Data))
             {
+                DebugLogger.LogDebug($"netcoredbg stdout: {e.Data}");
                 OnOutput?.Invoke(new OutputEventBody { Category = "stdout", Output = e.Data + "\n" });
             }
         };
@@ -95,23 +96,55 @@ public class DapClient : IAsyncDisposable
         {
             if (!string.IsNullOrEmpty(e.Data))
             {
+                DebugLogger.LogDebug($"netcoredbg stderr: {e.Data}");
                 OnOutput?.Invoke(new OutputEventBody { Category = "stderr", Output = e.Data + "\n" });
             }
         };
 
-        _netcoredbgProcess.Start();
-        _netcoredbgProcess.BeginOutputReadLine();
-        _netcoredbgProcess.BeginErrorReadLine();
+        try
+        {
+            DebugLogger.LogDebug($"Starting netcoredbg: {NetCoreDbgPath} {startInfo.Arguments}");
+            _netcoredbgProcess.Start();
+            _netcoredbgProcess.BeginOutputReadLine();
+            _netcoredbgProcess.BeginErrorReadLine();
+            
+            DebugLogger.LogDebug($"netcoredbg process started with PID: {_netcoredbgProcess.Id}");
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"Failed to start netcoredbg process. Make sure netcoredbg is installed and in PATH. Error: {ex.Message}", ex);
+        }
 
         // Wait a bit for the server to start
         await Task.Delay(500, cancellationToken);
+        
+        // Check if process exited early
+        if (_netcoredbgProcess.HasExited)
+        {
+            var exitCode = _netcoredbgProcess.ExitCode;
+            var errorMessage = $"netcoredbg process exited immediately with code {exitCode}.";
+            
+            if (exitCode == -1073741515) // 0xC0000135 - DLL not found
+            {
+                errorMessage += " This usually means .NET Core runtime is not installed or netcoredbg is not compatible with your system.";
+            }
+            else if (exitCode != 0)
+            {
+                errorMessage += " Check if netcoredbg is compatible with your system and .NET version.";
+            }
+            
+            throw new InvalidOperationException(errorMessage);
+        }
 
         // Connect via TCP
         _tcpClient = new TcpClient();
 
         var connectAttempts = 0;
         const int maxAttempts = 10;
+        Exception? lastException = null;
 
+        DebugLogger.LogDebug($"Attempting to connect to netcoredbg on port {port}...");
+        
         while (connectAttempts < maxAttempts)
         {
             try
@@ -119,19 +152,35 @@ public class DapClient : IAsyncDisposable
                 await _tcpClient.ConnectAsync("127.0.0.1", port, cancellationToken);
                 break;
             }
-            catch (SocketException) when (connectAttempts < maxAttempts - 1)
+            catch (SocketException ex) when (connectAttempts < maxAttempts - 1)
             {
+                lastException = ex;
                 connectAttempts++;
+                DebugLogger.LogDebug($"Connection attempt {connectAttempts}/{maxAttempts} failed: {ex.Message}");
                 await Task.Delay(200, cancellationToken);
             }
         }
 
         if (!_tcpClient.Connected)
         {
-            throw new InvalidOperationException($"Failed to connect to netcoredbg on port {port}");
+            var errorMsg = $"Failed to connect to netcoredbg on port {port} after {maxAttempts} attempts.";
+            if (lastException != null)
+            {
+                errorMsg += $" Last error: {lastException.Message}";
+            }
+            if (!_netcoredbgProcess.HasExited)
+            {
+                errorMsg += " The netcoredbg process is running but not accepting connections.";
+            }
+            else
+            {
+                errorMsg += $" The netcoredbg process exited with code {_netcoredbgProcess.ExitCode}.";
+            }
+            throw new InvalidOperationException(errorMsg);
         }
 
         _stream = _tcpClient.GetStream();
+        DebugLogger.LogDebug("Successfully connected to netcoredbg");
 
         // Start the receive loop
         _receiveTask = ReceiveLoopAsync(_cancellationTokenSource.Token);
@@ -142,16 +191,30 @@ public class DapClient : IAsyncDisposable
     /// </summary>
     public async Task<Capabilities?> InitializeAsync(CancellationToken cancellationToken = default)
     {
-        var args = new InitializeRequestArguments();
-        var response = await SendRequestAsync("initialize", args, cancellationToken);
-
-        if (response.Success && response.Body != null)
+        try
         {
-            var json = JsonSerializer.Serialize(response.Body);
-            return JsonSerializer.Deserialize<Capabilities>(json);
-        }
+            DebugLogger.LogDebug("Sending initialize request to debugger...");
+            var args = new InitializeRequestArguments();
+            var response = await SendRequestAsync("initialize", args, cancellationToken);
+            
+            DebugLogger.LogDebug($"Initialize response - Success: {response.Success}");
 
-        return null;
+            if (response.Success && response.Body != null)
+            {
+                var json = JsonSerializer.Serialize(response.Body);
+                var capabilities = JsonSerializer.Deserialize<Capabilities>(json);
+                DebugLogger.LogDebug("Debugger initialization completed successfully");
+                return capabilities;
+            }
+
+            DebugLogger.LogError($"Initialize failed - Success: {response.Success}, Body: {response.Body}");
+            return null;
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.LogError($"Exception during initialize: {ex.Message}", ex);
+            throw;
+        }
     }
 
     /// <summary>
@@ -159,16 +222,32 @@ public class DapClient : IAsyncDisposable
     /// </summary>
     public async Task<bool> LaunchAsync(string program, string[]? args = null, string? cwd = null, bool stopAtEntry = false, CancellationToken cancellationToken = default)
     {
-        var launchArgs = new LaunchRequestArguments
+        try
         {
-            Program = program,
-            Args = args,
-            Cwd = cwd ?? Path.GetDirectoryName(program),
-            StopAtEntry = stopAtEntry
-        };
+            DebugLogger.LogDebug($"Sending launch request for program: {program}");
+            var launchArgs = new LaunchRequestArguments
+            {
+                Program = program,
+                Args = args,
+                Cwd = cwd ?? Path.GetDirectoryName(program),
+                StopAtEntry = stopAtEntry
+            };
 
-        var response = await SendRequestAsync("launch", launchArgs, cancellationToken);
-        return response.Success;
+            var response = await SendRequestAsync("launch", launchArgs, cancellationToken);
+            DebugLogger.LogDebug($"Launch response - Success: {response.Success}");
+            
+            if (!response.Success)
+            {
+                DebugLogger.LogError($"Launch failed - Response: {JsonSerializer.Serialize(response)}");
+            }
+            
+            return response.Success;
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.LogError($"Exception during launch: {ex.Message}", ex);
+            throw;
+        }
     }
 
     /// <summary>
@@ -391,7 +470,7 @@ public class DapClient : IAsyncDisposable
 
         // Wait for response with timeout
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        cts.CancelAfter(TimeSpan.FromSeconds(30));
+        cts.CancelAfter(TimeSpan.FromSeconds(60));
 
         try
         {
