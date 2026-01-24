@@ -13,6 +13,7 @@ namespace McpDebugAdapter.Ui;
 public partial class UiAutomationService
 {
     private Process? _targetProcess;
+    private int _targetProcessId;
 
     // Regex to validate window IDs (typically numeric for X11)
     [GeneratedRegex(@"^\d+$")]
@@ -50,11 +51,13 @@ public partial class UiAutomationService
         try
         {
             _targetProcess = Process.GetProcessById(processId);
+            _targetProcessId = processId;
             return true;
         }
         catch
         {
             _targetProcess = null;
+            _targetProcessId = 0;
             return false;
         }
     }
@@ -994,7 +997,30 @@ public partial class UiAutomationService
         {
             try
             {
-                SetCursorPos(x, y);
+                int screenX = x;
+                int screenY = y;
+                
+                // First, ensure the target window is focused and convert coordinates
+                if (_targetProcessId > 0)
+                {
+                    var targetWindow = FindWindowByProcessId(_targetProcessId);
+                    if (targetWindow != IntPtr.Zero)
+                    {
+                        SetForegroundWindow(targetWindow);
+                        ShowWindow(targetWindow, SW_RESTORE); // Ensure not minimized
+                        Thread.Sleep(100); // Give time for window to come to front
+                        
+                        // Convert client coordinates to screen coordinates
+                        POINT point = new POINT { X = x, Y = y };
+                        if (ClientToScreen(targetWindow, ref point))
+                        {
+                            screenX = point.X;
+                            screenY = point.Y;
+                        }
+                    }
+                }
+
+                SetCursorPos(screenX, screenY);
 
                 uint downFlag, upFlag;
                 switch (button.ToLower())
@@ -1973,12 +1999,51 @@ public partial class UiAutomationService
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetForegroundWindow(IntPtr hWnd);
+    
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    
+    private const int SW_RESTORE = 9;
 
     [DllImport("user32.dll")]
     private static extern IntPtr SetFocus(IntPtr hWnd);
 
     [DllImport("user32.dll")]
     private static extern short VkKeyScan(char ch);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc enumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("user32.dll")]
+    private static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT
+    {
+        public int X;
+        public int Y;
+    }
+
+    private static IntPtr FindWindowByProcessId(int processId)
+    {
+        IntPtr targetWindow = IntPtr.Zero;
+        
+        EnumWindows((hWnd, lParam) =>
+        {
+            GetWindowThreadProcessId(hWnd, out uint windowProcessId);
+            if (windowProcessId == processId)
+            {
+                targetWindow = hWnd;
+                return false; // Stop enumeration
+            }
+            return true; // Continue enumeration
+        }, IntPtr.Zero);
+        
+        return targetWindow;
+    }
 
     #endregion
 }

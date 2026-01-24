@@ -175,6 +175,21 @@ public class EnhancedDebugSession
             _activeDebugger = vsdbgClient;
             IsVsDbgAttached = true;
             
+            // Wire up VsDbg events to update session state
+            _activeDebugger.OnStopped += (stoppedEvent) => 
+            {
+                _baseSession.UpdateSessionState(true, programPath, true); // paused = true
+                DebugLogger.LogDebug($"VsDbg stopped: {stoppedEvent.Reason}");
+            };
+            
+            _activeDebugger.OnTerminated += (terminatedEvent) =>
+            {
+                _baseSession.UpdateSessionState(false); // session ended
+                IsVsDbgAttached = false;
+                _activeDebugger = null;
+                DebugLogger.LogDebug("VsDbg session terminated");
+            };
+            
             // Update base session state to reflect active debugging
             _baseSession.UpdateSessionState(true, programPath);
             
@@ -638,9 +653,27 @@ public class EnhancedDebugSession
 
             DebugLogger.Log("Successfully attached VsDbg to process");
             
-            // Store the client for this session
+            // Store the client for this session and wire up events
             _activeDebugger = vsdbgClient;
             IsVsDbgAttached = true;
+            
+            // Wire up VsDbg events to update session state
+            _activeDebugger.OnStopped += (stoppedEvent) => 
+            {
+                _baseSession.UpdateSessionState(true, null, true); // paused = true
+                DebugLogger.LogDebug($"VsDbg stopped: {stoppedEvent.Reason}");
+            };
+            
+            _activeDebugger.OnTerminated += (terminatedEvent) =>
+            {
+                _baseSession.UpdateSessionState(false); // session ended
+                IsVsDbgAttached = false;
+                _activeDebugger = null;
+                DebugLogger.LogDebug("VsDbg session terminated");
+            };
+            
+            // Update base session state to reflect active debugging  
+            _baseSession.UpdateSessionState(true, null, false);
             
             return (true, "Successfully attached with VsDbg");
         }

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <PackageId>McpDebugAdapter.WpfHelper</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>MCP Debug Adapter</Authors>
+    <Description>WPF Helper library for MCP Debug Adapter to improve control discovery and interaction</Description>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>

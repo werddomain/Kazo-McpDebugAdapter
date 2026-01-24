@@ -11,7 +11,7 @@ namespace McpDebugAdapter;
 public class DebugSession
 {
     private readonly DapClient _dapClient;
-    private readonly UiAutomationService _uiService;
+    private readonly EnhancedUiAutomationService _uiService;
     private readonly object _lock = new();
     private Process? _debuggedProcess;
 
@@ -68,7 +68,10 @@ public class DebugSession
     public DebugSession()
     {
         _dapClient = new DapClient();
-        _uiService = new UiAutomationService();
+        _uiService = new EnhancedUiAutomationService();
+
+        // Configure the UI service with DAP client for expression evaluation
+        _uiService.SetDapClient(_dapClient);
 
         _dapClient.OnStopped += HandleStopped;
         _dapClient.OnOutput += HandleOutput;
@@ -172,6 +175,28 @@ public class DebugSession
                 IsPaused = stopAtEntry;
                 ProgramPath = programPath;
             }
+
+            // Check if WPF Helper API is available
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(2000); // Give the app time to start
+                    var available = await _uiService.CheckWpfHelperAsync();
+                    if (available)
+                    {
+                        DebugLogger.Log("WPF Helper API detected - Enhanced UI automation available");
+                    }
+                    else
+                    {
+                        DebugLogger.LogDebug("WPF Helper API not available - Using standard UI automation");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    DebugLogger.LogDebug($"Error checking WPF Helper API: {ex.Message}");
+                }
+            });
 
             var message = $"Debug session started for {Path.GetFileName(programPath)}";
             DebugLogger.Log(message);
@@ -568,7 +593,9 @@ public class DebugSession
             await TryFindDebuggedProcessAsync();
         }
 
-        return await _uiService.GetControlsAsXmlAsync(maxDepth);
+        // Try enhanced API first, fallback to standard
+        var enhancedResult = await _uiService.GetControlsEnhancedAsync();
+        return enhancedResult;
     }
 
     /// <summary>

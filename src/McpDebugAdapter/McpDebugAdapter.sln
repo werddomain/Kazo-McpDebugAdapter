@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 18
+VisualStudioVersion = 18.2.11415.280 d18.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "McpDebugAdapter", "McpDebugAdapter.csproj", "{B87FED9B-656C-6909-898F-55B76AB9772E}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B87FED9B-656C-6909-898F-55B76AB9772E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B87FED9B-656C-6909-898F-55B76AB9772E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B87FED9B-656C-6909-898F-55B76AB9772E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B87FED9B-656C-6909-898F-55B76AB9772E}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {F3F4787B-BBCB-4E4C-8A74-2F5A2DB100B7}
+	EndGlobalSection
+EndGlobal
