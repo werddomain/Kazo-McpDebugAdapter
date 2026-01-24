@@ -6,6 +6,8 @@ A Model Context Protocol (MCP) server that allows AI assistants to debug .NET ap
 
 ```
 AI (MCP Client) <==[Stdio / JSON-RPC]==> MCP Debug Adapter <==[TCP / DAP]==> netcoredbg
+        -- OR --
+AI (MCP Client) <==[TCP / JSON-RPC]==> MCP Debug Adapter <==[TCP / DAP]==> netcoredbg
 ```
 
 This application acts as a bridge between AI assistants (like Claude) and the .NET debugging ecosystem, enabling interactive debugging sessions through natural language.
@@ -28,6 +30,8 @@ This application acts as a bridge between AI assistants (like Claude) and the .N
 - 🔄 **Mouse operations** - Move, drag, scroll
 - 🎯 **Find controls** - Locate controls by text content
 - ✅ **Compatible with WPF, WinForms, WinUI, and MAUI**
+- 🌐 **TCP Server Mode** - Connect from VS Code via `localhost:5085`
+- 📝 **Debug Logging** - Comprehensive logging for diagnostics
 
 ## Prerequisites
 
@@ -51,6 +55,57 @@ For a self-contained executable:
 dotnet publish -c Release -r linux-x64 --self-contained
 # Or for Windows: dotnet publish -c Release -r win-x64 --self-contained
 # Or for macOS: dotnet publish -c Release -r osx-x64 --self-contained
+```
+
+## Running Modes
+
+### Stdio Mode (Default)
+
+The default mode reads from stdin and writes to stdout, suitable for MCP clients that spawn the server as a subprocess.
+
+```bash
+dotnet run --project src/McpDebugAdapter/McpDebugAdapter.csproj
+```
+
+### TCP Server Mode
+
+Run as a TCP server to allow connections from VS Code or other MCP clients over the network:
+
+```bash
+# Start with default port (5085)
+dotnet run --project src/McpDebugAdapter/McpDebugAdapter.csproj -- --tcp
+
+# Start with custom port
+dotnet run --project src/McpDebugAdapter/McpDebugAdapter.csproj -- --tcp --port 5085
+
+# Enable debug logging
+dotnet run --project src/McpDebugAdapter/McpDebugAdapter.csproj -- --tcp --port 5085 --debug
+```
+
+Then connect from VS Code using: `localhost:5085`
+
+### Command Line Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `--tcp` | Run as TCP server instead of stdio |
+| `--port <port>` | TCP port to listen on (default: 5085) |
+| `--debug` | Enable debug logging to stderr and debugger output |
+
+## Debug Logging
+
+When debug logging is enabled (via `--debug` flag or when running in Visual Studio debugger), the adapter outputs detailed diagnostic information to:
+
+- **stderr** - Console output that won't interfere with MCP protocol
+- **Debug Output** - Visual Studio's Debug Output window
+- **Custom log writers** - For TCP client notifications
+
+Log format:
+```
+[2024-01-20 10:30:45.123] [INFO] Message here
+[2024-01-20 10:30:45.124] [DEBUG] Detailed debug info
+[2024-01-20 10:30:45.125] [JSONRPC] RECV: {"jsonrpc":"2.0","method":"initialize",...}
+[2024-01-20 10:30:45.126] [JSONRPC] SEND: {"jsonrpc":"2.0","result":{...}}
 ```
 
 ## Configuration
@@ -96,6 +151,33 @@ If using an MCP-compatible VS Code extension, configure in your settings:
   }
 }
 ```
+
+### VS Code with TCP Server
+
+For TCP server mode, first start the server:
+
+```bash
+# In terminal or Visual Studio
+dotnet run --project src/McpDebugAdapter/McpDebugAdapter.csproj -- --tcp --port 5085 --debug
+```
+
+Then configure VS Code to connect to the running server:
+
+```json
+{
+  "mcp.servers": {
+    "dotnet-debugger": {
+      "url": "tcp://localhost:5085"
+    }
+  }
+}
+```
+
+**Benefits of TCP mode:**
+- Run the MCP server in Visual Studio with debugger attached
+- See all debug logs in Visual Studio's Output window
+- Intercept and debug potential errors in the MCP server itself
+- Keep the server running while restarting VS Code
 
 ## Available Tools
 
