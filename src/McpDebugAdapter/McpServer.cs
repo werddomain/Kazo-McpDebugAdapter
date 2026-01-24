@@ -20,16 +20,21 @@ public class McpServer
         new Tool
         {
             Name = "debug_launch",
-            Description = "Starts a new debug session for a .NET application. This launches netcoredbg and attaches it to the specified DLL.",
+            Description = "Starts a new debug session for a .NET application. This launches netcoredbg and attaches it to the specified program (DLL or EXE).",
             InputSchema = new ToolInputSchema
             {
                 Type = "object",
                 Properties = new Dictionary<string, ToolProperty>
                 {
+                    ["programPath"] = new ToolProperty
+                    {
+                        Type = "string",
+                        Description = "The full path to the .NET program to debug (DLL or EXE file)."
+                    },
                     ["dllPath"] = new ToolProperty
                     {
                         Type = "string",
-                        Description = "The full path to the .NET DLL file to debug."
+                        Description = "[Deprecated: use programPath instead] The full path to the .NET DLL file to debug."
                     },
                     ["args"] = new ToolProperty
                     {
@@ -43,7 +48,7 @@ public class McpServer
                         Description = "If true, the debugger will pause at the entry point of the program."
                     }
                 },
-                Required = ["dllPath"]
+                Required = []
             }
         },
         new Tool
@@ -602,12 +607,28 @@ public class McpServer
 
     private async Task<CallToolResult> HandleDebugLaunchAsync(Dictionary<string, object>? args, CancellationToken cancellationToken)
     {
-        if (args == null || !args.TryGetValue("dllPath", out var dllPathObj))
+        if (args == null)
         {
-            return CreateErrorResult("Missing required parameter: dllPath");
+            return CreateErrorResult("Missing required parameter: programPath (or dllPath)");
         }
 
-        var dllPath = dllPathObj.ToString()!;
+        // Accept either 'programPath' (preferred) or 'dllPath' (deprecated, for backwards compatibility)
+        string? programPath = null;
+        
+        if (args.TryGetValue("programPath", out var programPathObj))
+        {
+            programPath = programPathObj.ToString();
+        }
+        else if (args.TryGetValue("dllPath", out var dllPathObj))
+        {
+            programPath = dllPathObj.ToString();
+        }
+        
+        if (string.IsNullOrEmpty(programPath))
+        {
+            return CreateErrorResult("Missing required parameter: programPath (or dllPath)");
+        }
+
         string[]? programArgs = null;
         var stopAtEntry = false;
 
@@ -630,7 +651,7 @@ public class McpServer
             }
         }
 
-        var (success, message) = await _session.LaunchAsync(dllPath, programArgs, stopAtEntry);
+        var (success, message) = await _session.LaunchAsync(programPath, programArgs, stopAtEntry);
         return CreateResult(message, !success);
     }
 

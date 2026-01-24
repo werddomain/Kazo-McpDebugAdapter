@@ -46,7 +46,7 @@
 //
 // AVAILABLE TOOLS
 // ===============
-// - debug_launch(dllPath, args?, stopAtEntry?) - Start debugging a .NET DLL
+// - debug_launch(programPath, args?, stopAtEntry?) - Start debugging a .NET program (DLL or EXE)
 // - debug_stop() - Stop the debug session
 // - debug_set_breakpoint(file, line) - Set a breakpoint
 // - debug_remove_breakpoint(file, line) - Remove a breakpoint

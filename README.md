@@ -100,21 +100,31 @@ If using an MCP-compatible VS Code extension, configure in your settings:
 ## Available Tools
 
 ### `debug_launch`
-Starts a new debug session for a .NET application.
+Starts a new debug session for a .NET application (DLL or EXE).
 
 **Parameters:**
-- `dllPath` (required): Full path to the .NET DLL to debug
+- `programPath` (required): Full path to the .NET program to debug (DLL or EXE)
 - `args` (optional): Array of command-line arguments
 - `stopAtEntry` (optional): If true, pause at program entry point
 
-**Example:**
+**Example with DLL:**
 ```json
 {
-  "dllPath": "/path/to/MyApp.dll",
+  "programPath": "/path/to/MyApp.dll",
   "args": ["--config", "debug"],
   "stopAtEntry": true
 }
 ```
+
+**Example with EXE:**
+```json
+{
+  "programPath": "C:\\path\\to\\MyApp.exe",
+  "stopAtEntry": true
+}
+```
+
+> **Note:** The `dllPath` parameter is still supported for backwards compatibility but is deprecated. Use `programPath` instead.
 
 ### `debug_stop`
 Stops the current debug session and terminates the debugged program.
@@ -275,7 +285,7 @@ Here's an example conversation with Claude:
 User: Debug my .NET application at /home/user/MyApp/bin/Debug/net9.0/MyApp.dll
 
 Claude: I'll start a debug session for your application.
-[Calls debug_launch with dllPath="/home/user/MyApp/bin/Debug/net9.0/MyApp.dll"]
+[Calls debug_launch with programPath="/home/user/MyApp/bin/Debug/net9.0/MyApp.dll"]
 
 User: Set a breakpoint at line 42 in Program.cs
 
