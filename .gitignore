@@ -55,3 +55,6 @@ nunit-*.xml
 .vs/
 bin/
 obj/
+
+# Python
+__pycache__/

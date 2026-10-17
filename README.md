@@ -5,9 +5,9 @@ A Model Context Protocol (MCP) server that allows AI assistants to debug .NET ap
 ## Architecture
 
 ```
-AI (MCP Client) <==[Stdio / JSON-RPC]==> MCP Debug Adapter <==[TCP / DAP]==> netcoredbg
+AI (MCP Client) <==[Stdio / JSON-RPC]==> MCP Debug Adapter <==[stdio / DAP]==> netcoredbg
         -- OR --
-AI (MCP Client) <==[TCP / JSON-RPC]==> MCP Debug Adapter <==[TCP / DAP]==> netcoredbg
+AI (MCP Client) <==[TCP / JSON-RPC]==> MCP Debug Adapter <==[stdio / DAP]==> netcoredbg
 ```
 
 This application acts as a bridge between AI assistants (like Claude) and the .NET debugging ecosystem, enabling interactive debugging sessions through natural language.
@@ -35,12 +35,21 @@ This application acts as a bridge between AI assistants (like Claude) and the .N
 
 ## Prerequisites
 
-1. **.NET 9 SDK** - [Download](https://dotnet.microsoft.com/download/dotnet/9.0)
+1. **.NET SDK 8, 9 or 10** - [Download](https://dotnet.microsoft.com/download). The adapter targets
+   `net8.0` and rolls forward to the newest runtime installed. Programs you debug can target .NET 6 to 10.
 
-2. **netcoredbg** - Samsung's .NET Core debugger
-   - Install globally: `dotnet tool install -g netcoredbg`
-   - Or download from [Samsung/netcoredbg](https://github.com/Samsung/netcoredbg/releases)
-   - Ensure it's available in your PATH
+2. **netcoredbg** - Samsung's open source (MIT) .NET debugger
+   - Download the archive for your OS from [Samsung/netcoredbg releases](https://github.com/Samsung/netcoredbg/releases)
+     (`netcoredbg-win64.zip` on Windows) and extract it. Version 3.1 or newer is needed for .NET 9/10 apps.
+   - Then do one of the following:
+     - add the extracted `netcoredbg` folder to your `PATH`,
+     - set `NETCOREDBG_PATH` to the executable (e.g. `C:\tools\netcoredbg\netcoredbg.exe`),
+     - or extract it into a `netcoredbg` folder next to `McpDebugAdapter.exe`.
+   - There is no `dotnet tool` package for netcoredbg.
+
+> **Why not vsdbg (the debugger of the VS Code C# extension)?** Its license only allows it to be used
+> from Visual Studio, VS Code or Xamarin Studio, and it refuses to work with other clients. netcoredbg
+> speaks the same Debug Adapter Protocol and has no such restriction.
 
 ## Building
 
@@ -52,10 +61,22 @@ dotnet build
 For a self-contained executable:
 
 ```bash
-dotnet publish -c Release -r linux-x64 --self-contained
-# Or for Windows: dotnet publish -c Release -r win-x64 --self-contained
+dotnet publish -c Release -r win-x64 --self-contained
+# Or for Linux: dotnet publish -c Release -r linux-x64 --self-contained
 # Or for macOS: dotnet publish -c Release -r osx-x64 --self-contained
 ```
+
+## Checking that it works
+
+`tests/smoke_test.py` talks to the adapter exactly like an MCP client would: it launches
+`tests/SampleApp`, hits breakpoints (including a conditional one), steps, reads variables, then
+attaches to a running process.
+
+```bash
+python tests/smoke_test.py --netcoredbg C:\tools\netcoredbg\netcoredbg.exe
+```
+
+It ends with `SMOKE TEST PASSED` when everything works.
 
 ## Running Modes
 
@@ -188,21 +209,9 @@ Or use it with httpL
 
 **Exemple de prompt** :
 
-> Try to run dotnet-debugger to debug the exe of KazoVault.Ui.exe
-> 
-> ```JSON
-> {
->   "method": "debug_launch",
->   "params": {
->     "programPath": "C:\\...\\KazoVault.UI.exe",
->     "useVsDbg": true,
->     "useLaunchThenAttach": true,
->     "stopAtEntry": true
->   }
-> }
-> ```
-> 
-> met un breakpoint sur 'KillSwitch_Activated' dans #file:MainWindow.xaml.cs puis clique sur le button 'KillSwitchBtn' avec l'automationId='KillSwitchButton'
+> Lance `C:\...\KazoVault.UI.exe` avec dotnet-debugger, mets un breakpoint dans `KillSwitch_Activated`
+> de MainWindow.xaml.cs, prends une capture d'écran, clique sur le bouton KillSwitch, puis attends que
+> le breakpoint soit atteint et montre-moi les variables locales.
 
 **Benefits of TCP/HTTP modes:**
 - Run the MCP server in Visual Studio with debugger attached
@@ -213,31 +222,33 @@ Or use it with httpL
 ## Available Tools
 
 ### `debug_launch`
-Starts a new debug session for a .NET application (DLL or EXE).
+Starts a new debug session for a .NET application (DLL or EXE). Breakpoints set beforehand are sent before the program starts.
 
 **Parameters:**
-- `programPath` (required): Full path to the .NET program to debug (DLL or EXE)
+- `programPath` (required): Full path to the .NET program to debug (DLL or EXE), built in Debug so its `.pdb` is next to it
 - `args` (optional): Array of command-line arguments
+- `cwd` (optional): Working directory (defaults to the program's folder)
 - `stopAtEntry` (optional): If true, pause at program entry point
+- `netcoredbgPath` (optional): Path to netcoredbg if it is not found automatically
 
-**Example with DLL:**
-```json
-{
-  "programPath": "/path/to/MyApp.dll",
-  "args": ["--config", "debug"],
-  "stopAtEntry": true
-}
-```
-
-**Example with EXE:**
+**Example:**
 ```json
 {
   "programPath": "C:\\path\\to\\MyApp.exe",
-  "stopAtEntry": true
+  "args": ["--config", "debug"]
 }
 ```
 
 > **Note:** The `dllPath` parameter is still supported for backwards compatibility but is deprecated. Use `programPath` instead.
+
+### `debug_attach`
+Attaches to a running .NET process.
+
+**Parameters:**
+- `processId` or `processName`: The process to attach to (see `debug_list_processes`)
+
+### `debug_list_processes`
+Lists .NET processes that can be attached to. Optional `filter` on the process name.
 
 ### `debug_stop`
 Stops the current debug session and terminates the debugged program.
@@ -248,6 +259,10 @@ Sets a breakpoint at a specific line in a source file.
 **Parameters:**
 - `file` (required): Full path to the source file
 - `line` (required): Line number (1-based)
+- `condition` (optional): C# condition, e.g. `i == 3`
+
+The answer says whether the breakpoint is **bound** or **pending**. Pending is normal until the
+assembly containing the file is loaded; it binds by itself afterwards (see `debug_get_status`).
 
 ### `debug_remove_breakpoint`
 Removes a breakpoint from a specific line.
@@ -256,14 +271,20 @@ Removes a breakpoint from a specific line.
 - `file` (required): Full path to the source file
 - `line` (required): Line number (1-based)
 
-### `debug_step_next`
-Steps to the next line (Step Over). Executes the current line, stepping over any function calls.
-
-### `debug_step_in`
-Steps into the function call on the current line (Step In).
+### `debug_step_next` / `debug_step_in` / `debug_step_out`
+Step over, into, or out of the current function. They wait for the step to finish (`waitSeconds`, default 10) and return the new location.
 
 ### `debug_continue`
-Continues execution until the next breakpoint or program termination.
+Continues execution. By default it returns immediately; pass `waitSeconds` to wait for the next stop.
+
+### `debug_wait_for_stop`
+Waits (`waitSeconds`, default 30) until a breakpoint, step or exception stops the program, or it exits, and returns where. Use it after `debug_continue` or after clicking in the UI.
+
+### `debug_pause`
+Pauses the running program.
+
+### `debug_get_output`
+Returns the latest console output of the program (`maxLines`, default 100).
 
 ### `debug_evaluate`
 Evaluates an expression in the current debug context.
@@ -289,11 +310,13 @@ Returns the current status of the debug session including:
 - Whether a session is active
 - Whether the program is paused
 - Current thread and frame IDs
-- Stop reason
-- All set breakpoints
+- Stop reason and location
+- Debuggee process id and exit code
+- Every breakpoint with its bound/pending state
 
 ### `ui_take_screenshot`
-Takes a screenshot of the debugged application's main window. Returns a base64-encoded BMP image that can be used to visually inspect the application state during debugging.
+Takes a screenshot of the debugged application's main window and returns it as a PNG image the AI can look at.
+Pixel coordinates in this image are the coordinates the `ui_click` / `ui_mouse_*` tools expect.
 
 **Note:** Requires the debugged application to have a visible window.
 
@@ -306,11 +329,15 @@ Returns an XML representation of all UI controls in the debugged application's m
 **Example output:**
 ```xml
 <?xml version="1.0"?>
-<Window Title="My Application" ClassName="WindowClass" X="100" Y="100" Width="800" Height="600">
+<Window Title="My Application" ClassName="WindowClass" ScreenX="100" ScreenY="100" Width="800" Height="600">
   <Control Type="Button" Text="Click Me" X="10" Y="10" Width="100" Height="30" IsVisible="true" IsEnabled="true"/>
   <Control Type="TextBox" Text="" X="10" Y="50" Width="200" Height="25" IsVisible="true" IsEnabled="true"/>
 </Window>
 ```
+
+Control positions are relative to the window (same origin as the screenshot). WPF controls are drawn
+inside a single native window and have no handles of their own, so for WPF use coordinates read from
+a screenshot, or the optional `McpDebugAdapter.WpfHelper` library.
 
 ### `ui_set_process_id`
 Manually sets the process ID of the application to inspect for UI operations. Use this if automatic process detection fails.
@@ -319,11 +346,13 @@ Manually sets the process ID of the application to inspect for UI operations. Us
 - `processId` (required): The process ID (PID) of the application to inspect
 
 ### `ui_click`
-Clicks on a control at specific coordinates or by handle. Works with WPF, WinForms, WinUI, and MAUI applications.
+Clicks on a control at specific coordinates or by handle. The window is brought to the front first.
+The program must be running: while it is paused at a breakpoint its UI thread is frozen and cannot react.
 
 **Parameters:**
-- `x` (optional): X screen coordinate to click
-- `y` (optional): Y screen coordinate to click
+- `x` (optional): X in screenshot pixels (relative to the window's top-left corner)
+- `y` (optional): Y in screenshot pixels
+- `screenCoordinates` (optional): If true, `x`/`y` are absolute screen pixels
 - `handle` (optional): Window handle of the control to click (alternative to coordinates)
 - `button` (optional): Mouse button - 'left', 'right', or 'middle' (default: 'left')
 - `clickCount` (optional): Number of clicks (default: 1, use 2 for double-click)
@@ -345,11 +374,11 @@ Sends keyboard input including special keys and shortcuts.
   - Examples: `{Enter}`, `^c` (Ctrl+C), `%{F4}` (Alt+F4), `^+s` (Ctrl+Shift+S)
 
 ### `ui_mouse_move`
-Moves the mouse cursor to specified screen coordinates.
+Moves the mouse cursor (window-relative coordinates, or screen ones with `screenCoordinates: true`).
 
 **Parameters:**
-- `x` (required): X screen coordinate
-- `y` (required): Y screen coordinate
+- `x` (required): X coordinate
+- `y` (required): Y coordinate
 
 ### `ui_mouse_drag`
 Performs a mouse drag operation from one point to another.
@@ -431,8 +460,8 @@ This server implements the MCP (Model Context Protocol) specification over stdio
 
 ### Supported MCP Methods
 
-- `initialize` - Protocol handshake
-- `initialized` - Initialization acknowledgment
+- `initialize` - Protocol handshake (protocol versions 2024-11-05, 2025-03-26, 2025-06-18)
+- `notifications/*` - Accepted and never answered, as JSON-RPC requires
 - `tools/list` - List available debugging tools
 - `tools/call` - Execute a debugging tool
 - `ping` - Health check
@@ -441,19 +470,22 @@ This server implements the MCP (Model Context Protocol) specification over stdio
 ## Troubleshooting
 
 ### netcoredbg not found
-Ensure netcoredbg is installed and in your PATH:
+The error message lists where the adapter looked. Put netcoredbg in your PATH, set `NETCOREDBG_PATH`,
+or pass `netcoredbgPath` to `debug_launch`:
 ```bash
 which netcoredbg  # Linux/macOS
 where netcoredbg  # Windows
 ```
 
-### Connection timeout
-The adapter waits up to 2 seconds for netcoredbg to start. If your system is slow, you may need to increase the delay in `DapClient.cs`.
-
 ### Breakpoints not hitting
-- Ensure the DLL was built with debug symbols (`Debug` configuration)
-- Verify the file path matches exactly (case-sensitive on Linux)
-- Check that the line number is valid for the source file
+- Ensure the program was built with debug symbols (`Debug` configuration, `.pdb` next to the DLL)
+- Use the full path of the source file the program was built from
+- A breakpoint reported as **pending** binds once its assembly is loaded; check `debug_get_status`
+- Run with `--debug` to see every DAP message exchanged with netcoredbg on stderr
+
+### Clicks land in the wrong place
+- Use coordinates from `ui_take_screenshot` (window-relative), or pass `screenCoordinates: true` for absolute ones
+- Continue the program first: a paused program cannot process clicks
 
 ## License
 

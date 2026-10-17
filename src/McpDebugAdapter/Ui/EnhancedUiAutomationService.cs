@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Net.Http;
 using System.Text.Json;
 using System.Threading.Tasks;
-using System.Windows;
 using McpDebugAdapter.Dap;
 
 namespace McpDebugAdapter.Ui;
@@ -17,24 +16,11 @@ public partial class EnhancedUiAutomationService : UiAutomationService, IDisposa
     private bool _wpfHelperAvailable;
     private int _wpfHelperPort = 8899;
     private bool _disposed = false;
-    private SimpleWpfEvaluationService? _evaluationService;
 
     public EnhancedUiAutomationService() : base()
     {
         _httpClient = new HttpClient();
         _httpClient.Timeout = TimeSpan.FromSeconds(5);
-    }
-
-    /// <summary>
-    /// Sets the DAP client for expression evaluation
-    /// </summary>
-    public void SetDapClient(object dapClient)
-    {
-        if (dapClient is VsDbgClient vsDbgClient)
-        {
-            _evaluationService = new SimpleWpfEvaluationService(vsDbgClient);
-        }
-        // DapClient doesn't have EvaluateAsync, so we'll only support VsDbgClient for now
     }
 
     /// <summary>
@@ -59,7 +45,7 @@ public partial class EnhancedUiAutomationService : UiAutomationService, IDisposa
     /// <summary>
     /// Gets UI controls using WPF Helper API if available, fallback to base implementation
     /// </summary>
-    public async Task<(bool Success, string Data, string Message)> GetControlsEnhancedAsync()
+    public async Task<(bool Success, string Data, string Message)> GetControlsEnhancedAsync(int maxDepth = 10)
     {
         // Try WPF Helper API first
         if (_wpfHelperAvailable)
@@ -79,7 +65,7 @@ public partial class EnhancedUiAutomationService : UiAutomationService, IDisposa
             }
         }
 
-        return await GetControlsAsXmlAsync();
+        return await GetControlsAsXmlAsync(maxDepth);
     }
 
     /// <summary>
@@ -87,25 +73,6 @@ public partial class EnhancedUiAutomationService : UiAutomationService, IDisposa
     /// </summary>
     public async Task<(bool Success, string Data, string Message)> FindControlsByNameAsync(string name)
     {
-        // First try DAP expression evaluation
-        if (_evaluationService != null)
-        {
-            try
-            {
-                var result = await _evaluationService.GetControlBoundsByNameAsync(name);
-                if (result.Success)
-                {
-                    // Wrap single control in controls array format
-                    var wrappedData = $"{{\"controls\": [{result.Data}]}}";
-                    return (true, wrappedData, result.Message);
-                }
-            }
-            catch (Exception)
-            {
-                // Continue to fallback methods
-            }
-        }
-
         // Then try WPF Helper API
         if (_wpfHelperAvailable)
         {
@@ -160,23 +127,6 @@ public partial class EnhancedUiAutomationService : UiAutomationService, IDisposa
     /// </summary>
     public async Task<(bool Success, string Message)> HighlightControlAsync(string name, bool highlight = true)
     {
-        // First try DAP expression evaluation
-        if (_evaluationService != null)
-        {
-            try
-            {
-                var result = await _evaluationService.HighlightControlAsync(name, highlight);
-                if (result.Success)
-                {
-                    return result;
-                }
-            }
-            catch (Exception)
-            {
-                // Continue to fallback methods
-            }
-        }
-
         // Then try WPF Helper API
         if (_wpfHelperAvailable)
         {
@@ -206,31 +156,6 @@ public partial class EnhancedUiAutomationService : UiAutomationService, IDisposa
     /// </summary>
     public async Task<(bool Success, string Message)> ClickControlByNameAsync(string name, string button = "left", int clickCount = 1)
     {
-        // First try DAP expression evaluation to get precise coordinates
-        if (_evaluationService != null)
-        {
-            try
-            {
-                var (success, data, message) = await _evaluationService.GetControlBoundsByNameAsync(name);
-                if (success)
-                {
-                    var controlData = JsonSerializer.Deserialize<JsonDocument>(data);
-                    if (controlData?.RootElement.TryGetProperty("centerX", out var centerXProp) == true && 
-                        controlData.RootElement.TryGetProperty("centerY", out var centerYProp))
-                    {
-                        var x = (int)centerXProp.GetDouble();
-                        var y = (int)centerYProp.GetDouble();
-                        
-                        return await ClickAtAsync(x, y, button, clickCount);
-                    }
-                }
-            }
-            catch (Exception)
-            {
-                // Continue to fallback methods
-            }
-        }
-
         // Then try WPF Helper API
         if (_wpfHelperAvailable)
         {
@@ -253,7 +178,7 @@ public partial class EnhancedUiAutomationService : UiAutomationService, IDisposa
                                 var y = (int)centerProp.GetProperty("y").GetDouble();
                                 
                                 // Use the enhanced click with precise coordinates
-                                return await ClickAtAsync(x, y, button, clickCount);
+                                return await ClickAtAsync(x, y, button, clickCount, screenCoordinates: true);
                             }
                         }
                     }

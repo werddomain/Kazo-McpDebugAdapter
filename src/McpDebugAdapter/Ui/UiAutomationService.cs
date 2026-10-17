@@ -41,6 +41,7 @@ public partial class UiAutomationService
     public void SetTargetProcess(Process? process)
     {
         _targetProcess = process;
+        _targetProcessId = process?.Id ?? 0;
     }
 
     /// <summary>
@@ -64,7 +65,7 @@ public partial class UiAutomationService
 
     /// <summary>
     /// Takes a screenshot of the target application's main window.
-    /// Returns the screenshot as a base64-encoded BMP image.
+    /// Returns the screenshot as a base64-encoded PNG image.
     /// </summary>
     public async Task<(bool Success, string Data, string Message)> TakeScreenshotAsync()
     {
@@ -240,36 +241,8 @@ public partial class UiAutomationService
         GetDIBits(hdc, hBitmap, 0, (uint)height, pixels, ref bmi, 0);
         ReleaseDC(IntPtr.Zero, hdc);
 
-        // Create a simple BMP file in memory
-        using var ms = new MemoryStream();
-        using var writer = new BinaryWriter(ms);
-
-        // BMP Header
-        writer.Write((ushort)0x4D42); // 'BM'
-        writer.Write(54 + pixels.Length); // File size
-        writer.Write(0); // Reserved
-        writer.Write(54); // Pixel data offset
-
-        // DIB Header (BITMAPINFOHEADER)
-        writer.Write(40); // Header size
-        writer.Write(width);
-        writer.Write(height);
-        writer.Write((ushort)1); // Planes
-        writer.Write((ushort)32); // Bits per pixel
-        writer.Write(0); // Compression (BI_RGB)
-        writer.Write(pixels.Length); // Image size
-        writer.Write(0); // X pixels per meter
-        writer.Write(0); // Y pixels per meter
-        writer.Write(0); // Colors used
-        writer.Write(0); // Important colors
-
-        // Flip the image vertically (BMP is bottom-up)
-        for (int y = height - 1; y >= 0; y--)
-        {
-            writer.Write(pixels, y * stride, stride);
-        }
-
-        return ms.ToArray();
+        // GetDIBits gives top-down BGRA rows; encode them as PNG (compact, and an image type MCP clients display)
+        return PngEncoder.EncodeBgra(pixels, width, height, stride);
     }
 
     private async Task<(bool Success, string Xml, string Message)> GetControlsWindowsAsync(IntPtr hwnd, int maxDepth)
@@ -297,16 +270,16 @@ public partial class UiAutomationService
                 writer.WriteAttributeString("ClassName", className);
                 writer.WriteAttributeString("Handle", hwnd.ToString());
 
-                if (GetWindowRect(hwnd, out RECT rect))
-                {
-                    writer.WriteAttributeString("X", rect.Left.ToString());
-                    writer.WriteAttributeString("Y", rect.Top.ToString());
-                    writer.WriteAttributeString("Width", (rect.Right - rect.Left).ToString());
-                    writer.WriteAttributeString("Height", (rect.Bottom - rect.Top).ToString());
-                }
+                // Child coordinates are relative to this window, like ui_take_screenshot and ui_click
+                GetWindowRect(hwnd, out RECT rect);
+                writer.WriteAttributeString("CoordinateOrigin", "window top-left (same as screenshot pixels)");
+                writer.WriteAttributeString("ScreenX", rect.Left.ToString());
+                writer.WriteAttributeString("ScreenY", rect.Top.ToString());
+                writer.WriteAttributeString("Width", (rect.Right - rect.Left).ToString());
+                writer.WriteAttributeString("Height", (rect.Bottom - rect.Top).ToString());
 
                 // Enumerate child windows
-                EnumerateChildWindows(hwnd, writer, 1, maxDepth);
+                EnumerateChildWindows(hwnd, writer, 1, maxDepth, rect.Left, rect.Top);
 
                 writer.WriteEndElement(); // Window
                 writer.WriteEndDocument();
@@ -321,7 +294,7 @@ public partial class UiAutomationService
         });
     }
 
-    private static void EnumerateChildWindows(IntPtr parentHwnd, XmlWriter writer, int currentDepth, int maxDepth)
+    private static void EnumerateChildWindows(IntPtr parentHwnd, XmlWriter writer, int currentDepth, int maxDepth, int originX, int originY)
     {
         if (currentDepth >= maxDepth)
         {
@@ -354,8 +327,8 @@ public partial class UiAutomationService
 
             if (GetWindowRect(hwnd, out RECT rect))
             {
-                writer.WriteAttributeString("X", rect.Left.ToString());
-                writer.WriteAttributeString("Y", rect.Top.ToString());
+                writer.WriteAttributeString("X", (rect.Left - originX).ToString());
+                writer.WriteAttributeString("Y", (rect.Top - originY).ToString());
                 writer.WriteAttributeString("Width", (rect.Right - rect.Left).ToString());
                 writer.WriteAttributeString("Height", (rect.Bottom - rect.Top).ToString());
             }
@@ -366,7 +339,7 @@ public partial class UiAutomationService
             writer.WriteAttributeString("IsEnabled", isEnabled.ToString().ToLower());
 
             // Recurse into children
-            EnumerateChildWindows(hwnd, writer, currentDepth + 1, maxDepth);
+            EnumerateChildWindows(hwnd, writer, currentDepth + 1, maxDepth, originX, originY);
 
             writer.WriteEndElement(); // Control
             return true;
@@ -779,13 +752,15 @@ public partial class UiAutomationService
     }
 
     /// <summary>
-    /// Clicks at the specified screen coordinates.
+    /// Clicks at the specified coordinates. By default x/y are pixels in the window screenshot
+    /// (relative to the window's top-left corner); pass screenCoordinates for absolute screen pixels.
     /// </summary>
-    public async Task<(bool Success, string Message)> ClickAtAsync(int x, int y, string button = "left", int clickCount = 1)
+    public async Task<(bool Success, string Message)> ClickAtAsync(int x, int y, string button = "left", int clickCount = 1, bool screenCoordinates = false)
     {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            return await ClickAtWindowsAsync(x, y, button, clickCount);
+            var (screenX, screenY) = ToScreenWindows(x, y, screenCoordinates, bringToFront: true);
+            return await ClickAtWindowsAsync(screenX, screenY, button, clickCount);
         }
         else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
@@ -854,11 +829,12 @@ public partial class UiAutomationService
     /// <summary>
     /// Moves the mouse to the specified screen coordinates.
     /// </summary>
-    public async Task<(bool Success, string Message)> MouseMoveAsync(int x, int y)
+    public async Task<(bool Success, string Message)> MouseMoveAsync(int x, int y, bool screenCoordinates = false)
     {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            return await MouseMoveWindowsAsync(x, y);
+            var (screenX, screenY) = ToScreenWindows(x, y, screenCoordinates, bringToFront: false);
+            return await MouseMoveWindowsAsync(screenX, screenY);
         }
         else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
@@ -875,11 +851,13 @@ public partial class UiAutomationService
     /// <summary>
     /// Performs a mouse drag from one point to another.
     /// </summary>
-    public async Task<(bool Success, string Message)> MouseDragAsync(int startX, int startY, int endX, int endY, string button = "left")
+    public async Task<(bool Success, string Message)> MouseDragAsync(int startX, int startY, int endX, int endY, string button = "left", bool screenCoordinates = false)
     {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            return await MouseDragWindowsAsync(startX, startY, endX, endY, button);
+            var (fromX, fromY) = ToScreenWindows(startX, startY, screenCoordinates, bringToFront: true);
+            var (toX, toY) = ToScreenWindows(endX, endY, screenCoordinates, bringToFront: false);
+            return await MouseDragWindowsAsync(fromX, fromY, toX, toY, button);
         }
         else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
@@ -922,10 +900,15 @@ public partial class UiAutomationService
     /// <summary>
     /// Scrolls the mouse wheel at the current or specified position.
     /// </summary>
-    public async Task<(bool Success, string Message)> MouseScrollAsync(int delta, int? x = null, int? y = null)
+    public async Task<(bool Success, string Message)> MouseScrollAsync(int delta, int? x = null, int? y = null, bool screenCoordinates = false)
     {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
+            if (x.HasValue && y.HasValue)
+            {
+                var (screenX, screenY) = ToScreenWindows(x.Value, y.Value, screenCoordinates, bringToFront: true);
+                return await MouseScrollWindowsAsync(delta, screenX, screenY);
+            }
             return await MouseScrollWindowsAsync(delta, x, y);
         }
         else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
@@ -962,6 +945,54 @@ public partial class UiAutomationService
 
     #region Windows UI Interaction Implementation
 
+    /// <summary>
+    /// Converts window-relative coordinates (same origin as ui_take_screenshot, i.e. the
+    /// window's top-left corner including its title bar) to screen coordinates.
+    /// </summary>
+    private (int X, int Y) ToScreenWindows(int x, int y, bool screenCoordinates, bool bringToFront)
+    {
+        var targetWindow = GetTargetMainWindow();
+        if (targetWindow == IntPtr.Zero)
+        {
+            return (x, y);
+        }
+
+        if (bringToFront)
+        {
+            ShowWindow(targetWindow, SW_RESTORE);
+            SetForegroundWindow(targetWindow);
+            Thread.Sleep(100); // Give time for window to come to front
+        }
+
+        if (screenCoordinates || !GetWindowRect(targetWindow, out RECT rect))
+        {
+            return (x, y);
+        }
+
+        return (rect.Left + x, rect.Top + y);
+    }
+
+    private IntPtr GetTargetMainWindow()
+    {
+        try
+        {
+            if (_targetProcess != null)
+            {
+                _targetProcess.Refresh();
+                if (_targetProcess.MainWindowHandle != IntPtr.Zero)
+                {
+                    return _targetProcess.MainWindowHandle;
+                }
+            }
+        }
+        catch
+        {
+            // Fall back to window enumeration
+        }
+
+        return _targetProcessId > 0 ? FindWindowByProcessId(_targetProcessId) : IntPtr.Zero;
+    }
+
     private async Task<(bool Success, string Message)> ClickControlWindowsAsync(IntPtr handle)
     {
         return await Task.Run(() =>
@@ -991,35 +1022,12 @@ public partial class UiAutomationService
         });
     }
 
-    private async Task<(bool Success, string Message)> ClickAtWindowsAsync(int x, int y, string button, int clickCount)
+    private async Task<(bool Success, string Message)> ClickAtWindowsAsync(int screenX, int screenY, string button, int clickCount)
     {
         return await Task.Run(() =>
         {
             try
             {
-                int screenX = x;
-                int screenY = y;
-                
-                // First, ensure the target window is focused and convert coordinates
-                if (_targetProcessId > 0)
-                {
-                    var targetWindow = FindWindowByProcessId(_targetProcessId);
-                    if (targetWindow != IntPtr.Zero)
-                    {
-                        SetForegroundWindow(targetWindow);
-                        ShowWindow(targetWindow, SW_RESTORE); // Ensure not minimized
-                        Thread.Sleep(100); // Give time for window to come to front
-                        
-                        // Convert client coordinates to screen coordinates
-                        POINT point = new POINT { X = x, Y = y };
-                        if (ClientToScreen(targetWindow, ref point))
-                        {
-                            screenX = point.X;
-                            screenY = point.Y;
-                        }
-                    }
-                }
-
                 SetCursorPos(screenX, screenY);
 
                 uint downFlag, upFlag;
@@ -1049,7 +1057,7 @@ public partial class UiAutomationService
                     }
                 }
 
-                return (true, $"Clicked {button} button {clickCount} time(s) at ({x}, {y})");
+                return (true, $"Clicked {button} button {clickCount} time(s) at screen ({screenX}, {screenY})");
             }
             catch (Exception ex)
             {
