@@ -49,41 +49,22 @@
 //
 // PREREQUISITES
 // =============
-// - .NET 9 SDK installed
-// - vsdbg (recommended for .NET 10+ support) or netcoredbg installed
-//   vsdbg: Usually comes with VS Code C# extension
-//   netcoredbg: Install via: dotnet tool install -g netcoredbg or from https://github.com/Samsung/netcoredbg
-//
-// DEBUGGING MODES
-// ===============
-// 1. Direct Launch (default): Launches program directly with debugger attached
-//    - Fastest startup
-//    - Good for most scenarios
-// 
-// 2. Launch-then-Attach: Launches program first, then attaches debugger
-//    - More reliable for complex applications
-//    - Better compatibility with .NET 10+
-//    - Use: debug_launch(..., useLaunchThenAttach: true)
-//
-// 3. Attach to Existing Process: Attach to already running .NET process
-//    - Use: debug_attach(processId: 1234) or debug_attach(processName: "MyApp")
-//    - List processes with: debug_list_processes()
+// - .NET 8 runtime or newer to run the adapter (it targets net8.0 and rolls forward)
+// - netcoredbg (Samsung, MIT): https://github.com/Samsung/netcoredbg/releases
+//   Put it in PATH, set NETCOREDBG_PATH, or extract it into a "netcoredbg" folder next to this executable.
 //
 // AVAILABLE TOOLS
 // ===============
-// - debug_launch(programPath, args?, stopAtEntry?, useVsDbg?, useLaunchThenAttach?) - Start debugging a .NET program (DLL or EXE) with enhanced options
+// - debug_launch(programPath, args?, cwd?, stopAtEntry?, netcoredbgPath?) - Start debugging a .NET program (DLL or EXE)
 // - debug_attach(processId?, processName?) - Attach to an existing .NET process
-// - debug_list_processes(filter?) - List available .NET processes for debugging
+// - debug_list_processes(filter?) - List .NET processes that can be attached to
 // - debug_stop() - Stop the debug session
-// - debug_set_breakpoint(file, line) - Set a breakpoint
-// - debug_remove_breakpoint(file, line) - Remove a breakpoint
-// - debug_step_next() - Step over (next line)
-// - debug_step_in() - Step into function
-// - debug_continue() - Continue execution
-// - debug_evaluate(expression) - Evaluate an expression
-// - debug_get_stack() - Get current stack trace
-// - debug_get_variables() - Get local variables
-// - debug_get_status() - Get debug session status
+// - debug_set_breakpoint(file, line, condition?) / debug_remove_breakpoint(file, line)
+// - debug_continue(waitSeconds?) / debug_pause() / debug_wait_for_stop(waitSeconds?)
+// - debug_step_next() / debug_step_in() / debug_step_out()
+// - debug_evaluate(expression) / debug_get_stack() / debug_get_variables()
+// - debug_get_status() / debug_get_output(maxLines?)
+// - ui_* tools - screenshot, control tree, click, type, keys, mouse (Windows)
 
 using McpDebugAdapter;
 
@@ -118,9 +99,13 @@ if (useTcp)
 DebugLogger.Log($"Debug Logging: {DebugLogger.Enabled}");
 DebugLogger.Log($"Process ID: {Environment.ProcessId}");
 
-// Create the enhanced debug session (state management with advanced features)
-var session = new EnhancedDebugSession();
-DebugLogger.LogDebug("Enhanced debug session created with vsdbg and attach support");
+// Coordinates from screenshots and window rectangles must be real pixels, not DPI-virtualized ones
+if (OperatingSystem.IsWindows())
+{
+    NativeDpi.EnablePerMonitorDpiAwareness();
+}
+
+var session = new DebugSession();
 
 // Setup cancellation for graceful shutdown
 using var cts = new CancellationTokenSource();
@@ -183,4 +168,25 @@ finally
         await session.StopAsync();
     }
     DebugLogger.Log("=== MCP Debug Adapter Stopped ===");
+}
+
+internal static class NativeDpi
+{
+    private static readonly IntPtr PerMonitorAwareV2 = new(-4);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+
+    public static void EnablePerMonitorDpiAwareness()
+    {
+        try
+        {
+            SetProcessDpiAwarenessContext(PerMonitorAwareV2);
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.LogDebug($"Could not enable DPI awareness: {ex.Message}");
+        }
+    }
 }

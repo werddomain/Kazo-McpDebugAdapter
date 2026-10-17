@@ -10,7 +10,7 @@ namespace McpDebugAdapter;
 public class TcpMcpServer : IAsyncDisposable
 {
     private readonly int _port;
-    private readonly EnhancedDebugSession _session;
+    private readonly DebugSession _session;
     private TcpListener? _listener;
     private readonly List<TcpClient> _clients = [];
     private readonly object _lock = new();
@@ -20,7 +20,7 @@ public class TcpMcpServer : IAsyncDisposable
     /// </summary>
     /// <param name="port">The port to listen on (e.g., 5085).</param>
     /// <param name="session">The debug session to use.</param>
-    public TcpMcpServer(int port, EnhancedDebugSession session)
+    public TcpMcpServer(int port, DebugSession session)
     {
         _port = port;
         _session = session;

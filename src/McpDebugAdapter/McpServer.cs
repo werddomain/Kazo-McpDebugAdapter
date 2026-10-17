@@ -11,7 +11,7 @@ namespace McpDebugAdapter;
 /// </summary>
 public class McpServer
 {
-    private readonly EnhancedDebugSession _session;
+    private readonly DebugSession _session;
     private readonly TextWriter _output;
     private readonly TextReader _input;
     private readonly bool _useHttpWrapper;
@@ -21,7 +21,7 @@ public class McpServer
         new Tool
         {
             Name = "debug_launch",
-            Description = "Starts a new debug session for a .NET application. Supports multiple debugging approaches for better .NET 10+ compatibility.",
+            Description = "Starts a new debug session for a .NET application (DLL or EXE, .NET 6 to 10) under netcoredbg. Breakpoints set beforehand are applied before the program starts.",
             InputSchema = new ToolInputSchema
             {
                 Type = "object",
@@ -30,7 +30,7 @@ public class McpServer
                     ["programPath"] = new ToolProperty
                     {
                         Type = "string",
-                        Description = "The full path to the .NET program to debug (DLL or EXE file)."
+                        Description = "The full path to the .NET program to debug (DLL or EXE file), built in Debug so that .pdb files are next to it."
                     },
                     ["dllPath"] = new ToolProperty
                     {
@@ -43,20 +43,20 @@ public class McpServer
                         Description = "Optional command line arguments to pass to the program.",
                         Items = new ToolPropertyItems { Type = "string" }
                     },
+                    ["cwd"] = new ToolProperty
+                    {
+                        Type = "string",
+                        Description = "Optional working directory. Defaults to the program's folder."
+                    },
                     ["stopAtEntry"] = new ToolProperty
                     {
                         Type = "boolean",
                         Description = "If true, the debugger will pause at the entry point of the program."
                     },
-                    ["useVsDbg"] = new ToolProperty
+                    ["netcoredbgPath"] = new ToolProperty
                     {
-                        Type = "boolean", 
-                        Description = "Use vsdbg instead of netcoredbg for better .NET 10+ support. Default: true"
-                    },
-                    ["useLaunchThenAttach"] = new ToolProperty
-                    {
-                        Type = "boolean",
-                        Description = "Launch the process first, then attach the debugger. More reliable for some scenarios. Default: false"
+                        Type = "string",
+                        Description = "Optional path to netcoredbg(.exe). Defaults to NETCOREDBG_PATH, a netcoredbg folder next to the adapter, then PATH."
                     }
                 },
                 Required = []
@@ -65,7 +65,7 @@ public class McpServer
         new Tool
         {
             Name = "debug_attach",
-            Description = "Attaches the debugger to an existing .NET process by process ID or name.",
+            Description = "Attaches the debugger to an already running .NET process by process ID or name (use debug_list_processes to find it).",
             InputSchema = new ToolInputSchema
             {
                 Type = "object",
@@ -80,6 +80,11 @@ public class McpServer
                     {
                         Type = "string",
                         Description = "The process name to search for and attach to."
+                    },
+                    ["netcoredbgPath"] = new ToolProperty
+                    {
+                        Type = "string",
+                        Description = "Optional path to netcoredbg(.exe)."
                     }
                 },
                 Required = []
@@ -131,6 +136,11 @@ public class McpServer
                     {
                         Type = "integer",
                         Description = "The line number where the breakpoint should be set (1-based)."
+                    },
+                    ["condition"] = new ToolProperty
+                    {
+                        Type = "string",
+                        Description = "Optional C# condition; the breakpoint only stops when it is true (e.g. 'i == 3')."
                     }
                 },
                 Required = ["file", "line"]
@@ -166,7 +176,14 @@ public class McpServer
             InputSchema = new ToolInputSchema
             {
                 Type = "object",
-                Properties = new Dictionary<string, ToolProperty>()
+                Properties = new Dictionary<string, ToolProperty>
+                {
+                    ["waitSeconds"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "How long to wait for the step to complete and report the new location (default 10)."
+                    }
+                }
             }
         },
         new Tool
@@ -176,7 +193,14 @@ public class McpServer
             InputSchema = new ToolInputSchema
             {
                 Type = "object",
-                Properties = new Dictionary<string, ToolProperty>()
+                Properties = new Dictionary<string, ToolProperty>
+                {
+                    ["waitSeconds"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "How long to wait for the step to complete and report the new location (default 10)."
+                    }
+                }
             }
         },
         new Tool
@@ -186,7 +210,75 @@ public class McpServer
             InputSchema = new ToolInputSchema
             {
                 Type = "object",
+                Properties = new Dictionary<string, ToolProperty>
+                {
+                    ["waitSeconds"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "Optional: wait up to this many seconds for the next stop and report where (default 0, return immediately)."
+                    }
+                }
+            }
+        },
+        new Tool
+        {
+            Name = "debug_step_out",
+            Description = "Runs until the current function returns (Step Out).",
+            InputSchema = new ToolInputSchema
+            {
+                Type = "object",
+                Properties = new Dictionary<string, ToolProperty>
+                {
+                    ["waitSeconds"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "How long to wait for the step to complete (default 10)."
+                    }
+                }
+            }
+        },
+        new Tool
+        {
+            Name = "debug_pause",
+            Description = "Pauses the running program wherever it is.",
+            InputSchema = new ToolInputSchema
+            {
+                Type = "object",
                 Properties = new Dictionary<string, ToolProperty>()
+            }
+        },
+        new Tool
+        {
+            Name = "debug_wait_for_stop",
+            Description = "Waits until the program stops (breakpoint, step, exception) or exits, and returns where it stopped. Use after debug_continue or after triggering an action in the UI.",
+            InputSchema = new ToolInputSchema
+            {
+                Type = "object",
+                Properties = new Dictionary<string, ToolProperty>
+                {
+                    ["waitSeconds"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "Maximum time to wait (default 30)."
+                    }
+                }
+            }
+        },
+        new Tool
+        {
+            Name = "debug_get_output",
+            Description = "Returns the latest console output of the debugged program and of the debugger.",
+            InputSchema = new ToolInputSchema
+            {
+                Type = "object",
+                Properties = new Dictionary<string, ToolProperty>
+                {
+                    ["maxLines"] = new ToolProperty
+                    {
+                        Type = "integer",
+                        Description = "Number of lines to return (default 100)."
+                    }
+                }
             }
         },
         new Tool
@@ -240,7 +332,7 @@ public class McpServer
         new Tool
         {
             Name = "ui_take_screenshot",
-            Description = "Takes a screenshot of the debugged application's main window. Returns a base64-encoded BMP image. Useful for visually inspecting the application state during debugging.",
+            Description = "Takes a screenshot of the debugged application's main window (PNG image). Pixel coordinates in the image are the ones ui_click, ui_mouse_move, ui_mouse_drag and ui_mouse_scroll expect.",
             InputSchema = new ToolInputSchema
             {
                 Type = "object",
@@ -250,7 +342,7 @@ public class McpServer
         new Tool
         {
             Name = "ui_get_controls",
-            Description = "Returns an XML representation of all UI controls in the debugged application's main window. Includes control type, text, position, and hierarchy. Useful for understanding the UI structure and automating interactions.",
+            Description = "Returns an XML representation of the UI controls in the debugged application's main window (type, text, position, hierarchy). Positions are relative to the window, like screenshot pixels. WPF controls have no native handles, so for WPF prefer coordinates from a screenshot.",
             InputSchema = new ToolInputSchema
             {
                 Type = "object",
@@ -285,7 +377,7 @@ public class McpServer
         new Tool
         {
             Name = "ui_click",
-            Description = "Clicks on a control at specific coordinates or by handle. Works with WPF, WinForms, WinUI, and MAUI applications.",
+            Description = "Clicks in the debugged application, at coordinates or on a control handle. x/y are pixels of ui_take_screenshot (relative to the window's top-left corner). The program must be running (not paused at a breakpoint) for the UI to react.",
             InputSchema = new ToolInputSchema
             {
                 Type = "object",
@@ -294,12 +386,12 @@ public class McpServer
                     ["x"] = new ToolProperty
                     {
                         Type = "integer",
-                        Description = "The X coordinate (screen position) to click."
+                        Description = "X in screenshot pixels (relative to the window)."
                     },
                     ["y"] = new ToolProperty
                     {
                         Type = "integer",
-                        Description = "The Y coordinate (screen position) to click."
+                        Description = "Y in screenshot pixels (relative to the window)."
                     },
                     ["handle"] = new ToolProperty
                     {
@@ -310,6 +402,11 @@ public class McpServer
                     {
                         Type = "string",
                         Description = "Mouse button to click: 'left' (default), 'right', or 'middle'."
+                    },
+                    ["screenCoordinates"] = new ToolProperty
+                    {
+                        Type = "boolean",
+                        Description = "If true, coordinates are absolute screen pixels instead of window-relative."
                     },
                     ["clickCount"] = new ToolProperty
                     {
@@ -363,7 +460,7 @@ public class McpServer
         new Tool
         {
             Name = "ui_mouse_move",
-            Description = "Moves the mouse cursor to the specified screen coordinates.",
+            Description = "Moves the mouse cursor. x/y are screenshot pixels (relative to the window) unless screenCoordinates is true.",
             InputSchema = new ToolInputSchema
             {
                 Type = "object",
@@ -372,12 +469,17 @@ public class McpServer
                     ["x"] = new ToolProperty
                     {
                         Type = "integer",
-                        Description = "The X coordinate (screen position)."
+                        Description = "X in screenshot pixels."
                     },
                     ["y"] = new ToolProperty
                     {
                         Type = "integer",
-                        Description = "The Y coordinate (screen position)."
+                        Description = "Y in screenshot pixels."
+                    },
+                    ["screenCoordinates"] = new ToolProperty
+                    {
+                        Type = "boolean",
+                        Description = "If true, coordinates are absolute screen pixels instead of window-relative."
                     }
                 },
                 Required = ["x", "y"]
@@ -416,6 +518,11 @@ public class McpServer
                     {
                         Type = "string",
                         Description = "Mouse button to use: 'left' (default), 'right', or 'middle'."
+                    },
+                    ["screenCoordinates"] = new ToolProperty
+                    {
+                        Type = "boolean",
+                        Description = "If true, coordinates are absolute screen pixels instead of window-relative."
                     }
                 },
                 Required = ["startX", "startY", "endX", "endY"]
@@ -444,6 +551,11 @@ public class McpServer
                     {
                         Type = "integer",
                         Description = "Optional: Y coordinate to scroll at."
+                    },
+                    ["screenCoordinates"] = new ToolProperty
+                    {
+                        Type = "boolean",
+                        Description = "If true, x/y are absolute screen pixels instead of window-relative."
                     }
                 },
                 Required = ["delta"]
@@ -492,7 +604,7 @@ public class McpServer
         }
     ];
 
-    public McpServer(EnhancedDebugSession session, TextWriter? output = null, TextReader? input = null, bool useHttpWrapper = false)
+    public McpServer(DebugSession session, TextWriter? output = null, TextReader? input = null, bool useHttpWrapper = false)
     {
         _session = session;
         _output = output ?? Console.Out;
@@ -623,124 +735,117 @@ public class McpServer
             catch (Exception ex)
             {
                 DebugLogger.LogError("Error processing message", ex);
-                await SendErrorAsync(null, -32603, $"Internal error: {ex.Message}");
             }
         }
     }
 
     private async Task ProcessMessageAsync(string message, CancellationToken cancellationToken)
     {
-        try
+        var response = await ProcessMessageForResponseAsync(message, cancellationToken);
+        if (response != null)
         {
-            var request = JsonSerializer.Deserialize<JsonRpcRequest>(message);
-            if (request == null)
-            {
-                DebugLogger.LogWarning("Received invalid JSON-RPC request (null after deserialization)");
-                await SendErrorAsync(null, -32600, "Invalid Request");
-                return;
-            }
-
-            DebugLogger.LogDebug($"Processing request: method={request.Method}, id={request.Id}");
-            var result = await HandleRequestAsync(request, cancellationToken);
-
-            if (request.Id != null)
-            {
-                await SendResponseAsync(request.Id, result);
-            }
-        }
-        catch (JsonException ex)
-        {
-            DebugLogger.LogError("JSON parse error", ex);
-            await SendErrorAsync(null, -32700, "Parse error");
-        }
-        catch (Exception ex)
-        {
-            DebugLogger.LogError("Error handling request", ex);
-            await SendErrorAsync(null, -32603, $"Internal error: {ex.Message}");
+            DebugLogger.LogJsonRpc("SEND", response);
+            await _output.WriteLineAsync(response);
+            await _output.FlushAsync();
         }
     }
 
+    /// <summary>
+    /// Handles one JSON-RPC message and returns the serialized response, or null for notifications.
+    /// </summary>
     private async Task<string?> ProcessMessageForResponseAsync(string message, CancellationToken cancellationToken)
     {
+        JsonRpcRequest? request;
         try
         {
-            var request = JsonSerializer.Deserialize<JsonRpcRequest>(message);
-            if (request == null)
-            {
-                DebugLogger.LogWarning("Received invalid JSON-RPC request (null after deserialization)");
-                return JsonSerializer.Serialize(new JsonRpcResponse
-                {
-                    JsonRpc = "2.0",
-                    Id = null,
-                    Error = new JsonRpcError
-                    {
-                        Code = -32600,
-                        Message = "Invalid Request"
-                    }
-                });
-            }
-
-            DebugLogger.LogDebug($"Processing request: method={request.Method}, id={request.Id}");
-            var result = await HandleRequestAsync(request, cancellationToken);
-
-            if (request.Id != null)
-            {
-                return JsonSerializer.Serialize(new JsonRpcResponse
-                {
-                    JsonRpc = "2.0",
-                    Id = request.Id,
-                    Result = result
-                });
-            }
-            
-            // Notifications don't get responses
-            return null;
+            request = JsonSerializer.Deserialize<JsonRpcRequest>(message);
         }
         catch (JsonException ex)
         {
             DebugLogger.LogError("JSON parse error", ex);
+            return SerializeError(null, -32700, "Parse error");
+        }
+
+        if (request == null || string.IsNullOrEmpty(request.Method))
+        {
+            // Not a request (e.g. a response to something we never sent): nothing to answer
+            return request?.Id == null ? null : SerializeError(request.Id, -32600, "Invalid Request");
+        }
+
+        // Notifications (no id) never get a response, even when unknown or failing
+        var isNotification = request.Id == null;
+
+        try
+        {
+            DebugLogger.LogDebug($"Processing request: method={request.Method}, id={request.Id}");
+            var result = await HandleRequestAsync(request, cancellationToken);
+            if (isNotification)
+            {
+                return null;
+            }
+
             return JsonSerializer.Serialize(new JsonRpcResponse
             {
                 JsonRpc = "2.0",
-                Id = null,
-                Error = new JsonRpcError
-                {
-                    Code = -32700,
-                    Message = "Parse error"
-                }
-            });
+                Id = request.Id,
+                Result = result ?? new { }
+            }, ResponseSerializerOptions);
+        }
+        catch (MethodNotFoundException)
+        {
+            DebugLogger.LogDebug($"Method not found: {request.Method}");
+            return isNotification ? null : SerializeError(request.Id, -32601, $"Method not found: {request.Method}");
         }
         catch (Exception ex)
         {
             DebugLogger.LogError("Error handling request", ex);
-            return JsonSerializer.Serialize(new JsonRpcResponse
-            {
-                JsonRpc = "2.0",
-                Id = null,
-                Error = new JsonRpcError
-                {
-                    Code = -32603,
-                    Message = $"Internal error: {ex.Message}"
-                }
-            });
+            return isNotification ? null : SerializeError(request.Id, -32603, $"Internal error: {ex.Message}");
         }
     }
+
+    private static readonly JsonSerializerOptions ResponseSerializerOptions = new()
+    {
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+    };
+
+    private static string SerializeError(object? id, int code, string message)
+    {
+        return JsonSerializer.Serialize(new JsonRpcResponse
+        {
+            JsonRpc = "2.0",
+            Id = id,
+            Error = new JsonRpcError
+            {
+                Code = code,
+                Message = message
+            }
+        });
+    }
+
+    private sealed class MethodNotFoundException(string method) : Exception(method);
 
     private async Task<object?> HandleRequestAsync(JsonRpcRequest request, CancellationToken cancellationToken)
     {
         DebugLogger.LogDebug($"Handling method: {request.Method}");
-        
+
+        if (request.Method.StartsWith("notifications/", StringComparison.Ordinal))
+        {
+            DebugLogger.LogDebug($"Notification received: {request.Method}");
+            return null;
+        }
+
         return request.Method switch
         {
             "initialize" => HandleInitialize(request.Params),
             "initialized" => HandleInitialized(),
-            "notifications/initialized" => HandleNotificationsInitialized(),
             "logging/setLevel" => HandleLoggingSetLevel(request.Params),
             "tools/list" => HandleToolsList(),
             "tools/call" => await HandleToolsCallAsync(request.Params, cancellationToken),
+            "resources/list" => new { resources = Array.Empty<object>() },
+            "prompts/list" => new { prompts = Array.Empty<object>() },
             "ping" => new { },
             "shutdown" => HandleShutdown(),
-            _ => throw new InvalidOperationException($"Unknown method: {request.Method}")
+            _ => throw new MethodNotFoundException(request.Method)
         };
     }
 
@@ -748,9 +853,16 @@ public class McpServer
     {
         DebugLogger.Log("MCP Initialize request received");
         
+        // Answer with the client's version when we know it (we only use features common to all of them)
+        string[] supported = ["2025-06-18", "2025-03-26", "2024-11-05"];
+        var requested = @params is JsonElement { ValueKind: JsonValueKind.Object } p &&
+                        p.TryGetProperty("protocolVersion", out var v) && v.ValueKind == JsonValueKind.String
+            ? v.GetString()
+            : null;
+
         var result = new InitializeResult
         {
-            ProtocolVersion = "2024-11-05",
+            ProtocolVersion = requested != null && supported.Contains(requested) ? requested : supported[^1],
             Capabilities = new ServerCapabilities
             {
                 Tools = new ToolsCapability { ListChanged = false },
@@ -771,13 +883,6 @@ public class McpServer
     {
         // Client has acknowledged initialization
         DebugLogger.Log("MCP Initialized notification received - client ready");
-        return null;
-    }
-
-    private object? HandleNotificationsInitialized()
-    {
-        // Client has sent notifications/initialized
-        DebugLogger.Log("MCP notifications/initialized received - client ready for notifications");
         return null;
     }
 
@@ -848,9 +953,13 @@ public class McpServer
             "debug_stop" => await HandleDebugStopAsync(cancellationToken),
             "debug_set_breakpoint" => await HandleSetBreakpointAsync(toolParams.Arguments, cancellationToken),
             "debug_remove_breakpoint" => await HandleRemoveBreakpointAsync(toolParams.Arguments, cancellationToken),
-            "debug_step_next" => await HandleStepNextAsync(cancellationToken),
-            "debug_step_in" => await HandleStepInAsync(cancellationToken),
-            "debug_continue" => await HandleContinueAsync(cancellationToken),
+            "debug_step_next" => ToResult(await _session.StepNextAsync(GetWait(toolParams.Arguments, 10))),
+            "debug_step_in" => ToResult(await _session.StepInAsync(GetWait(toolParams.Arguments, 10))),
+            "debug_step_out" => ToResult(await _session.StepOutAsync(GetWait(toolParams.Arguments, 10))),
+            "debug_continue" => ToResult(await _session.ContinueAsync(GetWait(toolParams.Arguments, 0))),
+            "debug_pause" => ToResult(await _session.PauseAsync()),
+            "debug_wait_for_stop" => ToResult(await _session.WaitForStopAsync(GetWait(toolParams.Arguments, 30))),
+            "debug_get_output" => HandleGetOutput(toolParams.Arguments),
             "debug_evaluate" => await HandleEvaluateAsync(toolParams.Arguments, cancellationToken),
             "debug_get_stack" => await HandleGetStackAsync(cancellationToken),
             "debug_get_variables" => await HandleGetVariablesAsync(cancellationToken),
@@ -898,55 +1007,18 @@ public class McpServer
         }
 
         string[]? programArgs = null;
-        var stopAtEntry = false;
-        var useVsDbg = true; // Default to vsdbg for better .NET 10+ support
-        var useLaunchThenAttach = false;
-
-        if (args.TryGetValue("args", out var argsObj) && argsObj is JsonElement argsElement)
+        if (args.TryGetValue("args", out var argsObj) && argsObj is JsonElement { ValueKind: JsonValueKind.Array } argsElement)
         {
             programArgs = argsElement.EnumerateArray()
-                .Select(e => e.GetString() ?? string.Empty)
+                .Select(e => e.ValueKind == JsonValueKind.String ? e.GetString() ?? string.Empty : e.GetRawText())
                 .ToArray();
         }
 
-        if (args.TryGetValue("stopAtEntry", out var stopAtEntryObj))
-        {
-            if (stopAtEntryObj is JsonElement boolElement)
-            {
-                stopAtEntry = boolElement.GetBoolean();
-            }
-            else if (stopAtEntryObj is bool b)
-            {
-                stopAtEntry = b;
-            }
-        }
+        var stopAtEntry = GetBool(args, "stopAtEntry") ?? false;
+        var cwd = GetString(args, "cwd");
+        var netcoredbgPath = GetString(args, "netcoredbgPath");
 
-        if (args.TryGetValue("useVsDbg", out var useVsDbgObj))
-        {
-            if (useVsDbgObj is JsonElement boolElement)
-            {
-                useVsDbg = boolElement.GetBoolean();
-            }
-            else if (useVsDbgObj is bool b)
-            {
-                useVsDbg = b;
-            }
-        }
-
-        if (args.TryGetValue("useLaunchThenAttach", out var launchThenAttachObj))
-        {
-            if (launchThenAttachObj is JsonElement boolElement)
-            {
-                useLaunchThenAttach = boolElement.GetBoolean();
-            }
-            else if (launchThenAttachObj is bool b)
-            {
-                useLaunchThenAttach = b;
-            }
-        }
-
-        // Use enhanced session features
-        var (success, message) = await _session.LaunchEnhancedAsync(programPath, programArgs, stopAtEntry, useVsDbg, useLaunchThenAttach);
+        var (success, message) = await _session.LaunchAsync(programPath, programArgs, stopAtEntry, netcoredbgPath, cwd);
         return CreateResult(message, !success);
     }
 
@@ -981,7 +1053,7 @@ public class McpServer
             return CreateErrorResult("Either processId or processName must be specified.");
         }
 
-        var (success, message) = await _session.AttachToProcessAsync(processName, processId);
+        var (success, message) = await _session.AttachAsync(processId, processName, GetString(args, "netcoredbgPath"));
         return CreateResult(message, !success);
     }
 
@@ -1057,7 +1129,7 @@ public class McpServer
             return CreateErrorResult("Invalid line number");
         }
 
-        var (success, message) = await _session.SetBreakpointAsync(file, line);
+        var (success, message) = await _session.SetBreakpointAsync(file, line, GetString(args, "condition"));
         return CreateResult(message, !success);
     }
 
@@ -1098,22 +1170,16 @@ public class McpServer
         return CreateResult(message, !success);
     }
 
-    private async Task<CallToolResult> HandleStepNextAsync(CancellationToken cancellationToken)
+    private CallToolResult HandleGetOutput(Dictionary<string, object>? args)
     {
-        var (success, message) = await _session.StepNextAsync();
-        return CreateResult(message, !success);
-    }
+        var maxLines = 100;
+        if (args != null && args.TryGetValue("maxLines", out var maxLinesObj))
+        {
+            maxLines = Math.Max(1, GetInt32Value(maxLinesObj));
+        }
 
-    private async Task<CallToolResult> HandleStepInAsync(CancellationToken cancellationToken)
-    {
-        var (success, message) = await _session.StepInAsync();
-        return CreateResult(message, !success);
-    }
-
-    private async Task<CallToolResult> HandleContinueAsync(CancellationToken cancellationToken)
-    {
-        var (success, message) = await _session.ContinueAsync();
-        return CreateResult(message, !success);
+        var lines = _session.GetRecentOutput(maxLines);
+        return CreateResult(lines.Length == 0 ? "No output yet." : string.Join("\n", lines), false);
     }
 
     private async Task<CallToolResult> HandleEvaluateAsync(Dictionary<string, object>? args, CancellationToken cancellationToken)
@@ -1182,8 +1248,18 @@ public class McpServer
             threadId = _session.CurrentThreadId,
             frameId = _session.CurrentFrameId,
             stopReason = _session.StopReason,
-            breakpoints = _session.Breakpoints.SelectMany(kvp =>
-                kvp.Value.Select(line => new { file = kvp.Key, line })).ToArray()
+            location = _session.CurrentLocation,
+            processId = _session.ProcessId,
+            exitCode = _session.ExitCode,
+            breakpoints = _session.BreakpointDetails.Select(b => new
+            {
+                file = b.File,
+                line = b.Line,
+                condition = b.Condition,
+                verified = b.Verified,
+                boundLine = b.ActualLine,
+                message = b.Message
+            }).ToArray()
         };
 
         var json = JsonSerializer.Serialize(status, new JsonSerializerOptions { WriteIndented = true });
@@ -1199,9 +1275,15 @@ public class McpServer
             return CreateResult(message, true);
         }
 
-        // Return the image as base64 with a data URI prefix for easy display
-        var output = $"Screenshot captured successfully.\n\nBase64 Image Data (BMP format):\ndata:image/bmp;base64,{imageData}";
-        return CreateResult(output, false);
+        return new CallToolResult
+        {
+            Content =
+            [
+                new ContentItem { Type = "image", Data = imageData, MimeType = "image/png" },
+                new ContentItem { Type = "text", Text = message }
+            ],
+            IsError = false
+        };
     }
 
     private async Task<CallToolResult> HandleGetUiControlsAsync(Dictionary<string, object>? args, CancellationToken cancellationToken)
@@ -1255,8 +1337,9 @@ public class McpServer
             return CreateErrorResult("Invalid process ID");
         }
 
-        _session.SetDebuggedProcessId(processId);
-        return CreateResult($"Target process set to PID {processId}", false);
+        return _session.SetDebuggedProcessId(processId)
+            ? CreateResult($"Target process set to PID {processId}", false)
+            : CreateErrorResult($"Process {processId} not found.");
     }
 
     private async Task<CallToolResult> HandleUiClickAsync(Dictionary<string, object>? args, CancellationToken cancellationToken)
@@ -1290,7 +1373,7 @@ public class McpServer
             clickCount = GetInt32Value(clickCountObj);
         }
 
-        var (clickSuccess, clickMessage) = await _session.ClickAtAsync(x, y, button, clickCount);
+        var (clickSuccess, clickMessage) = await _session.ClickAtAsync(x, y, button, clickCount, GetBool(args, "screenCoordinates") ?? false);
         return CreateResult(clickMessage, !clickSuccess);
     }
 
@@ -1335,7 +1418,7 @@ public class McpServer
         int x = GetInt32Value(xObj);
         int y = GetInt32Value(yObj);
 
-        var (success, message) = await _session.MouseMoveAsync(x, y);
+        var (success, message) = await _session.MouseMoveAsync(x, y, GetBool(args, "screenCoordinates") ?? false);
         return CreateResult(message, !success);
     }
 
@@ -1361,7 +1444,7 @@ public class McpServer
             button = buttonObj.ToString() ?? "left";
         }
 
-        var (success, message) = await _session.MouseDragAsync(startX, startY, endX, endY, button);
+        var (success, message) = await _session.MouseDragAsync(startX, startY, endX, endY, button, GetBool(args, "screenCoordinates") ?? false);
         return CreateResult(message, !success);
     }
 
@@ -1382,7 +1465,7 @@ public class McpServer
             y = GetInt32Value(yObj);
         }
 
-        var (success, message) = await _session.MouseScrollAsync(delta, x, y);
+        var (success, message) = await _session.MouseScrollAsync(delta, x, y, GetBool(args, "screenCoordinates") ?? false);
         return CreateResult(message, !success);
     }
 
@@ -1430,11 +1513,53 @@ public class McpServer
         return CreateResult(message, true);
     }
 
+    private static CallToolResult ToResult((bool Success, string Message) result)
+        => CreateResult(result.Message, !result.Success);
+
+    private static TimeSpan GetWait(Dictionary<string, object>? args, int defaultSeconds)
+    {
+        var seconds = defaultSeconds;
+        if (args != null && args.TryGetValue("waitSeconds", out var value))
+        {
+            seconds = GetInt32Value(value);
+        }
+
+        return TimeSpan.FromSeconds(Math.Clamp(seconds, 0, 600));
+    }
+
+    private static string? GetString(Dictionary<string, object>? args, string name)
+    {
+        if (args == null || !args.TryGetValue(name, out var value) || value == null)
+        {
+            return null;
+        }
+
+        var text = value is JsonElement { ValueKind: JsonValueKind.String } element ? element.GetString() : value.ToString();
+        return string.IsNullOrWhiteSpace(text) ? null : text;
+    }
+
+    private static bool? GetBool(Dictionary<string, object>? args, string name)
+    {
+        if (args == null || !args.TryGetValue(name, out var value) || value == null)
+        {
+            return null;
+        }
+
+        return value switch
+        {
+            bool b => b,
+            JsonElement { ValueKind: JsonValueKind.True } => true,
+            JsonElement { ValueKind: JsonValueKind.False } => false,
+            _ => bool.TryParse(value.ToString(), out var parsed) ? parsed : null
+        };
+    }
+
     private static int GetInt32Value(object obj)
     {
         if (obj is JsonElement element)
         {
-            return element.GetInt32();
+            return element.ValueKind == JsonValueKind.Number ? (int)element.GetDouble()
+                : int.TryParse(element.ToString(), out var fromText) ? fromText : 0;
         }
         else if (obj is int i)
         {
@@ -1480,44 +1605,6 @@ public class McpServer
         // Could send notifications to the client here
         // For now, we just log or store them for retrieval via debug_get_status
         DebugLogger.LogDebug($"Debug event: {eventName}");
-    }
-
-    private async Task SendResponseAsync(object id, object? result)
-    {
-        var response = new JsonRpcResponse
-        {
-            Id = id,
-            Result = result
-        };
-
-        var json = JsonSerializer.Serialize(response, new JsonSerializerOptions
-        {
-            DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
-        });
-
-        DebugLogger.LogJsonRpc("SEND", json);
-        await _output.WriteLineAsync(json);
-        await _output.FlushAsync();
-    }
-
-    private async Task SendErrorAsync(object? id, int code, string message)
-    {
-        DebugLogger.LogError($"Sending error response: code={code}, message={message}");
-        
-        var response = new JsonRpcResponse
-        {
-            Id = id,
-            Error = new JsonRpcError
-            {
-                Code = code,
-                Message = message
-            }
-        };
-
-        var json = JsonSerializer.Serialize(response);
-        DebugLogger.LogJsonRpc("SEND", json);
-        await _output.WriteLineAsync(json);
-        await _output.FlushAsync();
     }
 
     private static CallToolResult CreateResult(string text, bool isError)

@@ -1,24 +1,59 @@
 using System.Diagnostics;
-using System.Text.Json;
 using McpDebugAdapter.Dap;
 using McpDebugAdapter.Ui;
 
 namespace McpDebugAdapter;
 
 /// <summary>
-/// Manages the state of a debug session including threads, frames, and breakpoints.
+/// Location where the debuggee is currently stopped.
+/// </summary>
+public record StopLocation(string Reason, int ThreadId, string? Description, string? Function, string? File, int Line);
+
+/// <summary>
+/// State of one breakpoint as last reported by the debugger.
+/// </summary>
+public class BreakpointInfo
+{
+    public string File { get; init; } = string.Empty;
+    public int Line { get; init; }
+    public string? Condition { get; set; }
+    public int? Id { get; set; }
+    public bool Verified { get; set; }
+    public int? ActualLine { get; set; }
+    public string? Message { get; set; }
+
+    public string Describe()
+    {
+        var where = $"{Path.GetFileName(File)}:{Line}";
+        if (Verified)
+        {
+            return ActualLine is { } actual && actual != Line
+                ? $"{where} (bound to line {actual})"
+                : $"{where} (bound)";
+        }
+
+        return $"{where} (pending: {Message ?? "will bind when the module is loaded"})";
+    }
+}
+
+/// <summary>
+/// Manages one debug session (netcoredbg via DAP) plus UI automation of the debuggee.
 /// </summary>
 public class DebugSession
 {
-    private readonly DapClient _dapClient;
-    private readonly EnhancedUiAutomationService _uiService;
-    private readonly object _lock = new();
-    private Process? _debuggedProcess;
+    private const int MaxOutputMessages = 1000;
+    private static readonly TimeSpan InitializedTimeout = TimeSpan.FromSeconds(30);
 
-    /// <summary>
-    /// The DAP client used for communication with the debugger.
-    /// </summary>
-    public DapClient DapClient => _dapClient;
+    private readonly EnhancedUiAutomationService _uiService = new();
+    private readonly object _lock = new();
+    private readonly Dictionary<string, List<BreakpointInfo>> _breakpoints = new(PathComparer);
+    private DapClient? _dapClient;
+    private Process? _debuggedProcess;
+    private bool _attached;
+    private TaskCompletionSource<StopLocation> _stopSignal = NewStopSignal();
+
+    private static StringComparer PathComparer =>
+        OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
 
     /// <summary>
     /// Indicates whether a debug session is currently active.
@@ -46,17 +81,55 @@ public class DebugSession
     public string? StopReason { get; private set; }
 
     /// <summary>
+    /// Where the debuggee is stopped, when it is.
+    /// </summary>
+    public StopLocation? CurrentLocation { get; private set; }
+
+    /// <summary>
     /// Path to the program being debugged.
     /// </summary>
     public string? ProgramPath { get; private set; }
 
     /// <summary>
-    /// Map of file paths to their breakpoint lines.
+    /// OS process id of the debuggee.
     /// </summary>
-    public Dictionary<string, List<int>> Breakpoints { get; } = new();
+    public int? ProcessId { get; private set; }
 
     /// <summary>
-    /// Output messages from the debugger.
+    /// Exit code of the debuggee once it exited.
+    /// </summary>
+    public int? ExitCode { get; private set; }
+
+    /// <summary>
+    /// Map of file paths to their breakpoint lines.
+    /// </summary>
+    public Dictionary<string, List<int>> Breakpoints
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _breakpoints.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Select(b => b.Line).ToList());
+            }
+        }
+    }
+
+    /// <summary>
+    /// Detailed state of every breakpoint.
+    /// </summary>
+    public IReadOnlyList<BreakpointInfo> BreakpointDetails
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _breakpoints.Values.SelectMany(list => list).ToList();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Output messages from the debugger and the debuggee (most recent last).
     /// </summary>
     public List<string> OutputMessages { get; } = new();
 
@@ -65,230 +138,302 @@ public class DebugSession
     /// </summary>
     public event Action<string, object?>? OnDebugEvent;
 
-    public DebugSession()
-    {
-        _dapClient = new DapClient();
-        _uiService = new EnhancedUiAutomationService();
-
-        // Configure the UI service with DAP client for expression evaluation
-        _uiService.SetDapClient(_dapClient);
-
-        _dapClient.OnStopped += HandleStopped;
-        _dapClient.OnOutput += HandleOutput;
-        _dapClient.OnTerminated += HandleTerminated;
-        _dapClient.OnInitialized += HandleInitialized;
-    }
-
     /// <summary>
-    /// Starts a new debug session.
+    /// Starts a new debug session by launching a program under netcoredbg.
     /// </summary>
     /// <param name="programPath">Path to the program (DLL or EXE) to debug.</param>
     /// <param name="args">Command line arguments for the program.</param>
     /// <param name="stopAtEntry">Whether to stop at entry point.</param>
-    /// <param name="netcoredbgPath">Path to netcoredbg executable.</param>
+    /// <param name="netcoredbgPath">Path to netcoredbg executable (optional).</param>
+    /// <param name="cwd">Working directory (defaults to the program's folder).</param>
     public async Task<(bool Success, string Message)> LaunchAsync(
         string programPath,
         string[]? args = null,
         bool stopAtEntry = false,
-        string? netcoredbgPath = null)
+        string? netcoredbgPath = null,
+        string? cwd = null)
     {
+        if (IsActive)
+        {
+            return (false, "A debug session is already active. Stop it first.");
+        }
+
+        programPath = Path.GetFullPath(programPath);
+        if (!File.Exists(programPath))
+        {
+            return (false, $"File not found: {programPath}");
+        }
+
+        var launchArgs = new LaunchRequestArguments
+        {
+            Program = programPath,
+            Args = args ?? [],
+            Cwd = cwd ?? Path.GetDirectoryName(programPath),
+            StopAtEntry = stopAtEntry
+        };
+
+        DebugLogger.Log($"Launching {programPath} under netcoredbg (stopAtEntry={stopAtEntry})");
+        _attached = false;
+        return await StartSessionAsync(
+            client => client.SendLaunchAsync(launchArgs),
+            programPath,
+            netcoredbgPath,
+            $"Debug session started for {Path.GetFileName(programPath)}");
+    }
+
+    /// <summary>
+    /// Attaches the debugger to an already running .NET process.
+    /// </summary>
+    public async Task<(bool Success, string Message)> AttachAsync(int? processId, string? processName, string? netcoredbgPath = null)
+    {
+        if (IsActive)
+        {
+            return (false, "A debug session is already active. Stop it first.");
+        }
+
+        if (processId == null)
+        {
+            if (string.IsNullOrEmpty(processName))
+            {
+                return (false, "Either processId or processName must be specified.");
+            }
+
+            var matches = ProcessLaunchManager.FindDebuggableProcesses(processName);
+            if (matches.Count == 0)
+            {
+                return (false, $"No .NET process found matching '{processName}'.");
+            }
+
+            if (matches.Count > 1)
+            {
+                return (false, $"Several processes match '{processName}', pass processId instead:\n" +
+                               string.Join("\n", matches.Select(p => $"  {p}")));
+            }
+
+            processId = matches[0].Id;
+        }
+
+        string? program;
         try
         {
-            if (IsActive)
-            {
-                return (false, "A debug session is already active. Stop it first.");
-            }
+            using var process = Process.GetProcessById(processId.Value);
+            program = process.MainModule?.FileName;
+        }
+        catch (ArgumentException)
+        {
+            return (false, $"Process with ID {processId} not found.");
+        }
+        catch
+        {
+            program = null;
+        }
 
-            if (!File.Exists(programPath))
-            {
-                return (false, $"File not found: {programPath}");
-            }
+        var attachArgs = new AttachRequestArguments { ProcessId = processId.Value };
 
-            // Check .NET version compatibility
-            var targetFramework = GetTargetFramework(programPath);
-            if (!string.IsNullOrEmpty(targetFramework))
-            {
-                DebugLogger.Log($"Target framework: {targetFramework}");
-                if (targetFramework.StartsWith("net10.") || targetFramework.StartsWith("net1"))
-                {
-                    var warningMsg = "WARNING: Debugging .NET 10+ applications may not be fully supported with netcoredbg 3.x. " +
-                                   "If you experience issues, consider:\\n" +
-                                   "1. Using a newer version of netcoredbg\\n" +
-                                   "2. Building your application with an earlier .NET version (like net8.0 or net9.0)\\n" +
-                                   "3. Using Visual Studio or Visual Studio Code's built-in debugger for .NET 10+ apps";
-                    DebugLogger.LogWarning(warningMsg);
-                    
-                    // For now, we'll still attempt debugging but with clear warnings
-                }
-            }
+        DebugLogger.Log($"Attaching netcoredbg to process {processId}");
+        _attached = true;
+        var result = await StartSessionAsync(
+            client => client.SendAttachAsync(attachArgs),
+            program,
+            netcoredbgPath,
+            $"Attached to process {processId}");
 
-            DebugLogger.Log($"Starting debug session for: {programPath}");
-            DebugLogger.Log($"Arguments: {(args != null ? string.Join(" ", args) : "(none)")}");
-            DebugLogger.Log($"Stop at entry: {stopAtEntry}");
-            
-            if (!string.IsNullOrEmpty(netcoredbgPath))
-            {
-                _dapClient.NetCoreDbgPath = netcoredbgPath;
-            }
+        if (result.Success)
+        {
+            SetDebuggedProcessId(processId.Value);
+        }
 
-            // Use CancellationTokenSource with timeout for better control
+        return result;
+    }
+
+    /// <summary>
+    /// Runs the DAP start-up sequence: initialize, launch/attach, wait for "initialized",
+    /// send breakpoints, configurationDone, then wait for the launch/attach response.
+    /// </summary>
+    private async Task<(bool Success, string Message)> StartSessionAsync(
+        Func<DapClient, Task<DapResponse>> sendStartRequest,
+        string? programPath,
+        string? netcoredbgPath,
+        string successMessage)
+    {
+        var client = new DapClient { NetCoreDbgPath = netcoredbgPath };
+        Subscribe(client);
+
+        lock (_lock)
+        {
+            _dapClient = client;
+            IsPaused = false;
+            CurrentThreadId = 0;
+            CurrentFrameId = 0;
+            CurrentLocation = null;
+            StopReason = null;
+            ProcessId = null;
+            ExitCode = null;
+            ProgramPath = programPath;
+            _stopSignal = NewStopSignal();
+            OutputMessages.Clear();
+        }
+
+        try
+        {
             using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
             var cancellationToken = timeoutCts.Token;
 
-            // Start the DAP client
-            DebugLogger.LogDebug("Starting DAP client...");
-            await _dapClient.StartAsync(cancellationToken: cancellationToken);
+            await client.StartAsync(cancellationToken);
+            await client.InitializeAsync(cancellationToken);
 
-            // Initialize
-            DebugLogger.LogDebug("Initializing debugger...");
-            var capabilities = await _dapClient.InitializeAsync(cancellationToken);
-            if (capabilities == null)
+            var startResponse = sendStartRequest(client);
+
+            // netcoredbg answers launch right away, other adapters only after configurationDone:
+            // wait for whichever comes first between "initialized" and a failed response.
+            var initialized = client.WaitForInitializedAsync(InitializedTimeout, cancellationToken);
+            var first = await Task.WhenAny(initialized, startResponse);
+            if (first == startResponse)
             {
-                return (false, "Failed to initialize debugger - no capabilities returned.");
+                DapClient.EnsureSuccess(await startResponse);
             }
-
-            // Launch
-            DebugLogger.LogDebug($"Launching program: {programPath}");
-            var launched = await _dapClient.LaunchAsync(programPath, args, Path.GetDirectoryName(programPath), stopAtEntry, cancellationToken);
-            if (!launched)
-            {
-                return (false, "Failed to launch program - launch request failed.");
-            }
-
-            // Set any pending breakpoints
-            if (Breakpoints.Any())
-            {
-                DebugLogger.LogDebug($"Setting {Breakpoints.Sum(bp => bp.Value.Count)} pending breakpoints...");
-                foreach (var (file, lines) in Breakpoints)
-                {
-                    await _dapClient.SetBreakpointsAsync(file, [.. lines], cancellationToken);
-                }
-            }
-
-            // Configuration done
-            DebugLogger.LogDebug("Sending configuration done...");
-            await _dapClient.ConfigurationDoneAsync(cancellationToken);
+            await initialized;
 
             lock (_lock)
             {
                 IsActive = true;
-                IsPaused = stopAtEntry;
-                ProgramPath = programPath;
             }
 
-            // Check if WPF Helper API is available
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    await Task.Delay(2000); // Give the app time to start
-                    var available = await _uiService.CheckWpfHelperAsync();
-                    if (available)
-                    {
-                        DebugLogger.Log("WPF Helper API detected - Enhanced UI automation available");
-                    }
-                    else
-                    {
-                        DebugLogger.LogDebug("WPF Helper API not available - Using standard UI automation");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    DebugLogger.LogDebug($"Error checking WPF Helper API: {ex.Message}");
-                }
-            });
+            await SendAllBreakpointsAsync(client, cancellationToken);
+            await client.SetExceptionBreakpointsAsync([], cancellationToken);
+            await client.ConfigurationDoneAsync(cancellationToken);
+            DapClient.EnsureSuccess(await startResponse);
 
-            var message = $"Debug session started for {Path.GetFileName(programPath)}";
+            StartWpfHelperProbe();
+
+            var message = successMessage;
+            var breakpoints = BreakpointDetails;
+            if (breakpoints.Count > 0)
+            {
+                message += "\nBreakpoints:\n" + string.Join("\n", breakpoints.Select(b => "  " + b.Describe()));
+            }
+
             DebugLogger.Log(message);
             return (true, message);
         }
-        catch (OperationCanceledException)
-        {
-            var errorMsg = "Debug session launch was cancelled (timeout or cancellation)";
-            DebugLogger.LogError(errorMsg);
-            return (false, errorMsg);
-        }
         catch (Exception ex)
         {
-            var errorMsg = $"Failed to start debug session: {ex.Message}";
-            DebugLogger.LogError(errorMsg, ex);
-            return (false, errorMsg);
+            var details = ex is TimeoutException or OperationCanceledException
+                ? "timed out waiting for netcoredbg"
+                : ex.Message;
+            var stderr = client.GetDebuggerStderr();
+            if (!string.IsNullOrEmpty(stderr) && !details.Contains(stderr))
+            {
+                details += $"\nnetcoredbg stderr:\n{stderr}";
+            }
+
+            DebugLogger.LogError($"Failed to start debug session: {details}", ex);
+            await TearDownAsync(terminateDebuggee: !_attached);
+            return (false, $"Failed to start debug session: {details}");
         }
     }
 
-    private string? GetTargetFramework(string programPath)
+    private void Subscribe(DapClient client)
     {
-        try
+        client.OnStopped += body => HandleStopped(client, body);
+        client.OnContinued += _ => HandleContinued(client);
+        client.OnOutput += HandleOutput;
+        client.OnTerminated += body => HandleTerminated(client, body);
+        client.OnExited += code =>
         {
-            var directory = Path.GetDirectoryName(programPath);
-            if (string.IsNullOrEmpty(directory))
-                return null;
-
-            // Look for .deps.json file which contains target framework info
-            var depsJsonFile = Path.ChangeExtension(programPath, ".deps.json");
-            if (File.Exists(depsJsonFile))
+            lock (_lock)
             {
-                var depsContent = File.ReadAllText(depsJsonFile);
-                using var depsJson = JsonDocument.Parse(depsContent);
-                
-                if (depsJson.RootElement.TryGetProperty("targets", out var targets))
-                {
-                    var firstTarget = targets.EnumerateObject().FirstOrDefault();
-                    return firstTarget.Name;
-                }
+                if (_dapClient == client) ExitCode = code;
             }
-
-            // Fallback: try to infer from directory name
-            var parts = directory.Split(Path.DirectorySeparatorChar);
-            var netFrameworkPart = parts.FirstOrDefault(p => p.StartsWith("net"));
-            return netFrameworkPart;
-        }
-        catch (Exception ex)
+        };
+        client.OnProcess += pid =>
         {
-            DebugLogger.LogDebug($"Could not determine target framework: {ex.Message}");
-            return null;
+            lock (_lock)
+            {
+                if (_dapClient != client) return;
+                ProcessId = pid;
+            }
+            SetDebuggedProcessId(pid);
+        };
+        client.OnBreakpointChanged += HandleBreakpointChanged;
+    }
+
+    private async Task SendAllBreakpointsAsync(DapClient client, CancellationToken cancellationToken)
+    {
+        List<string> files;
+        lock (_lock)
+        {
+            files = _breakpoints.Keys.ToList();
+        }
+
+        foreach (var file in files)
+        {
+            await SendFileBreakpointsAsync(client, file, cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Sends every breakpoint of a file (DAP replaces the whole set per file) and records
+    /// the debugger's answer, which comes back in the same order as the request.
+    /// </summary>
+    private async Task SendFileBreakpointsAsync(DapClient client, string file, CancellationToken cancellationToken = default)
+    {
+        List<BreakpointInfo> entries;
+        lock (_lock)
+        {
+            entries = _breakpoints.TryGetValue(file, out var list) ? list.ToList() : [];
+        }
+
+        var requested = entries.Select(b => new SourceBreakpoint { Line = b.Line, Condition = b.Condition }).ToArray();
+        var result = await client.SetBreakpointsAsync(file, requested, cancellationToken);
+
+        lock (_lock)
+        {
+            for (var i = 0; i < entries.Count && i < result.Length; i++)
+            {
+                entries[i].Id = result[i].Id;
+                entries[i].Verified = result[i].Verified;
+                entries[i].ActualLine = result[i].Line > 0 ? result[i].Line : null;
+                entries[i].Message = result[i].Message;
+            }
         }
     }
 
     /// <summary>
     /// Sets a breakpoint at the specified file and line.
     /// </summary>
-    public async Task<(bool Success, string Message)> SetBreakpointAsync(string filePath, int line)
+    public async Task<(bool Success, string Message)> SetBreakpointAsync(string filePath, int line, string? condition = null)
     {
         try
         {
-            // Normalize path
             filePath = Path.GetFullPath(filePath);
+            if (!File.Exists(filePath))
+            {
+                return (false, $"Source file not found: {filePath}");
+            }
 
+            BreakpointInfo entry;
             lock (_lock)
             {
-                if (!Breakpoints.ContainsKey(filePath))
+                if (!_breakpoints.TryGetValue(filePath, out var list))
                 {
-                    Breakpoints[filePath] = new List<int>();
+                    list = [];
+                    _breakpoints[filePath] = list;
                 }
 
-                if (!Breakpoints[filePath].Contains(line))
-                {
-                    Breakpoints[filePath].Add(line);
-                }
+                entry = list.FirstOrDefault(b => b.Line == line) ?? new BreakpointInfo { File = filePath, Line = line };
+                entry.Condition = condition;
+                if (!list.Contains(entry)) list.Add(entry);
             }
 
-            if (IsActive)
+            var client = _dapClient;
+            if (!IsActive || client == null)
             {
-                var breakpoints = await _dapClient.SetBreakpointsAsync(filePath, [.. Breakpoints[filePath]]);
-                var bp = breakpoints.FirstOrDefault(b => b.Line == line);
-
-                if (bp != null && bp.Verified)
-                {
-                    return (true, $"Breakpoint set at {Path.GetFileName(filePath)}:{line}");
-                }
-                else if (bp != null)
-                {
-                    return (false, $"Breakpoint at {Path.GetFileName(filePath)}:{line} could not be verified: {bp.Message ?? "Unknown reason"}");
-                }
+                return (true, $"Breakpoint queued at {Path.GetFileName(filePath)}:{line} (sent when the session starts)");
             }
 
-            return (true, $"Breakpoint queued at {Path.GetFileName(filePath)}:{line} (will be set when session starts)");
+            await SendFileBreakpointsAsync(client, filePath);
+            return (true, "Breakpoint set at " + entry.Describe());
         }
         catch (Exception ex)
         {
@@ -305,17 +450,29 @@ public class DebugSession
         {
             filePath = Path.GetFullPath(filePath);
 
+            bool removed;
             lock (_lock)
             {
-                if (Breakpoints.TryGetValue(filePath, out var lines))
-                {
-                    lines.Remove(line);
-                }
+                removed = _breakpoints.TryGetValue(filePath, out var list) && list.RemoveAll(b => b.Line == line) > 0;
             }
 
-            if (IsActive && Breakpoints.TryGetValue(filePath, out var remainingLines))
+            if (!removed)
             {
-                await _dapClient.SetBreakpointsAsync(filePath, [.. remainingLines]);
+                return (false, $"No breakpoint at {Path.GetFileName(filePath)}:{line}");
+            }
+
+            var client = _dapClient;
+            if (IsActive && client != null)
+            {
+                await SendFileBreakpointsAsync(client, filePath);
+            }
+
+            lock (_lock)
+            {
+                if (_breakpoints.TryGetValue(filePath, out var list) && list.Count == 0)
+                {
+                    _breakpoints.Remove(filePath);
+                }
             }
 
             return (true, $"Breakpoint removed from {Path.GetFileName(filePath)}:{line}");
@@ -329,106 +486,160 @@ public class DebugSession
     /// <summary>
     /// Steps to the next line (Step Over).
     /// </summary>
-    public async Task<(bool Success, string Message)> StepNextAsync()
-    {
-        try
-        {
-            if (!IsActive)
-            {
-                return (false, "No active debug session.");
-            }
-
-            if (!IsPaused)
-            {
-                return (false, "Program is not paused.");
-            }
-
-            var success = await _dapClient.NextAsync(CurrentThreadId);
-            if (success)
-            {
-                lock (_lock)
-                {
-                    IsPaused = false;
-                }
-                return (true, "Stepping to next line...");
-            }
-
-            return (false, "Step next failed.");
-        }
-        catch (Exception ex)
-        {
-            return (false, $"Step next failed: {ex.Message}");
-        }
-    }
+    public Task<(bool Success, string Message)> StepNextAsync(TimeSpan? wait = null)
+        => ResumeAsync("Step over", (client, thread) => client.NextAsync(thread), wait ?? TimeSpan.FromSeconds(10));
 
     /// <summary>
     /// Steps into the current function call.
     /// </summary>
-    public async Task<(bool Success, string Message)> StepInAsync()
-    {
-        try
-        {
-            if (!IsActive)
-            {
-                return (false, "No active debug session.");
-            }
+    public Task<(bool Success, string Message)> StepInAsync(TimeSpan? wait = null)
+        => ResumeAsync("Step in", (client, thread) => client.StepInAsync(thread), wait ?? TimeSpan.FromSeconds(10));
 
-            if (!IsPaused)
-            {
-                return (false, "Program is not paused.");
-            }
-
-            var success = await _dapClient.StepInAsync(CurrentThreadId);
-            if (success)
-            {
-                lock (_lock)
-                {
-                    IsPaused = false;
-                }
-                return (true, "Stepping into...");
-            }
-
-            return (false, "Step in failed.");
-        }
-        catch (Exception ex)
-        {
-            return (false, $"Step in failed: {ex.Message}");
-        }
-    }
+    /// <summary>
+    /// Steps out of the current function.
+    /// </summary>
+    public Task<(bool Success, string Message)> StepOutAsync(TimeSpan? wait = null)
+        => ResumeAsync("Step out", (client, thread) => client.StepOutAsync(thread), wait ?? TimeSpan.FromSeconds(10));
 
     /// <summary>
     /// Continues execution until the next breakpoint.
     /// </summary>
-    public async Task<(bool Success, string Message)> ContinueAsync()
+    public Task<(bool Success, string Message)> ContinueAsync(TimeSpan? wait = null)
+        => ResumeAsync("Continue", (client, thread) => client.ContinueAsync(thread), wait ?? TimeSpan.Zero);
+
+    private async Task<(bool Success, string Message)> ResumeAsync(string action, Func<DapClient, int, Task> send, TimeSpan wait)
     {
+        var client = _dapClient;
+        if (!IsActive || client == null)
+        {
+            return (false, "No active debug session.");
+        }
+
+        if (!IsPaused)
+        {
+            return (false, "Program is not paused.");
+        }
+
+        int threadId;
+        Task<StopLocation> nextStop;
+        lock (_lock)
+        {
+            threadId = CurrentThreadId;
+            // Mark running before sending: the next "stopped" event can arrive before the response
+            MarkRunning();
+            nextStop = _stopSignal.Task;
+        }
+
         try
         {
-            if (!IsActive)
-            {
-                return (false, "No active debug session.");
-            }
-
-            if (!IsPaused)
-            {
-                return (false, "Program is not paused.");
-            }
-
-            var success = await _dapClient.ContinueAsync(CurrentThreadId);
-            if (success)
-            {
-                lock (_lock)
-                {
-                    IsPaused = false;
-                }
-                return (true, "Continuing execution...");
-            }
-
-            return (false, "Continue failed.");
+            await send(client, threadId);
         }
         catch (Exception ex)
         {
-            return (false, $"Continue failed: {ex.Message}");
+            return (false, $"{action} failed: {ex.Message}");
         }
+
+        if (wait <= TimeSpan.Zero)
+        {
+            return (true, $"{action}: program is running. Use debug_wait_for_stop to wait for the next breakpoint.");
+        }
+
+        return await WaitForStopCoreAsync(nextStop, wait, $"{action} done");
+    }
+
+    /// <summary>
+    /// Pauses the running program.
+    /// </summary>
+    public async Task<(bool Success, string Message)> PauseAsync()
+    {
+        var client = _dapClient;
+        if (!IsActive || client == null)
+        {
+            return (false, "No active debug session.");
+        }
+
+        if (IsPaused)
+        {
+            return (true, "Program is already paused.");
+        }
+
+        Task<StopLocation> nextStop;
+        lock (_lock)
+        {
+            nextStop = _stopSignal.Task;
+        }
+
+        try
+        {
+            // netcoredbg rejects threadId 0, so name a real thread (it pauses all of them anyway)
+            var threadId = CurrentThreadId;
+            if (threadId == 0)
+            {
+                threadId = (await client.GetThreadsAsync()).FirstOrDefault()?.Id ?? 0;
+            }
+            await client.PauseAsync(threadId);
+        }
+        catch (Exception ex)
+        {
+            return (false, $"Pause failed: {ex.Message}");
+        }
+
+        return await WaitForStopCoreAsync(nextStop, TimeSpan.FromSeconds(10), "Paused");
+    }
+
+    /// <summary>
+    /// Waits until the program stops (breakpoint, step, exception, pause) or exits.
+    /// </summary>
+    public async Task<(bool Success, string Message)> WaitForStopAsync(TimeSpan timeout)
+    {
+        if (!IsActive)
+        {
+            return (false, DescribeEnded("No active debug session."));
+        }
+
+        Task<StopLocation> nextStop;
+        lock (_lock)
+        {
+            if (IsPaused && CurrentLocation != null)
+            {
+                return (true, "Already stopped: " + FormatLocation(CurrentLocation));
+            }
+
+            nextStop = _stopSignal.Task;
+        }
+
+        return await WaitForStopCoreAsync(nextStop, timeout, "Stopped");
+    }
+
+    private async Task<(bool Success, string Message)> WaitForStopCoreAsync(Task<StopLocation> stop, TimeSpan timeout, string prefix)
+    {
+        try
+        {
+            var location = await stop.WaitAsync(timeout);
+            return (true, $"{prefix}: {FormatLocation(location)}");
+        }
+        catch (TimeoutException)
+        {
+            return (true, $"Program still running after {timeout.TotalSeconds:0}s (no breakpoint hit yet).");
+        }
+        catch (Exception)
+        {
+            return (true, DescribeEnded("Program ended."));
+        }
+    }
+
+    private string DescribeEnded(string message)
+    {
+        return ExitCode is { } code ? $"{message} Exit code: {code}." : message;
+    }
+
+    private static string FormatLocation(StopLocation location)
+    {
+        var where = location.File != null
+            ? $"{location.Function} at {location.File}:{location.Line}"
+            : location.Function ?? "unknown location";
+        var reason = string.IsNullOrEmpty(location.Description) ? location.Reason : $"{location.Reason}, {location.Description}";
+        return $"{where} (reason: {reason}, thread {location.ThreadId})";
     }
 
     /// <summary>
@@ -436,25 +647,21 @@ public class DebugSession
     /// </summary>
     public async Task<(bool Success, string Result, string? Type)> EvaluateAsync(string expression)
     {
+        var client = _dapClient;
+        if (!IsActive || client == null)
+        {
+            return (false, "No active debug session.", null);
+        }
+
+        if (!IsPaused)
+        {
+            return (false, "Program is not paused. Cannot evaluate expressions while running.", null);
+        }
+
         try
         {
-            if (!IsActive)
-            {
-                return (false, "No active debug session.", null);
-            }
-
-            if (!IsPaused)
-            {
-                return (false, "Program is not paused. Cannot evaluate expressions while running.", null);
-            }
-
-            var result = await _dapClient.EvaluateAsync(expression, CurrentFrameId);
-            if (result != null)
-            {
-                return (true, result.Result, result.Type);
-            }
-
-            return (false, "Evaluation failed.", null);
+            var result = await client.EvaluateAsync(expression, CurrentFrameId);
+            return (true, result.Result, result.Type);
         }
         catch (Exception ex)
         {
@@ -467,19 +674,20 @@ public class DebugSession
     /// </summary>
     public async Task<(bool Success, Dap.StackFrame[] Frames, string Message)> GetStackTraceAsync()
     {
+        var client = _dapClient;
+        if (!IsActive || client == null)
+        {
+            return (false, [], "No active debug session.");
+        }
+
+        if (!IsPaused)
+        {
+            return (false, [], "Program is not paused.");
+        }
+
         try
         {
-            if (!IsActive)
-            {
-                return (false, [], "No active debug session.");
-            }
-
-            if (!IsPaused)
-            {
-                return (false, [], "Program is not paused.");
-            }
-
-            var frames = await _dapClient.GetStackTraceAsync(CurrentThreadId);
+            var frames = await client.GetStackTraceAsync(CurrentThreadId);
             return (true, frames, $"Retrieved {frames.Length} stack frames.");
         }
         catch (Exception ex)
@@ -493,28 +701,27 @@ public class DebugSession
     /// </summary>
     public async Task<(bool Success, Variable[] Variables, string Message)> GetLocalVariablesAsync()
     {
+        var client = _dapClient;
+        if (!IsActive || client == null)
+        {
+            return (false, [], "No active debug session.");
+        }
+
+        if (!IsPaused)
+        {
+            return (false, [], "Program is not paused.");
+        }
+
         try
         {
-            if (!IsActive)
+            var scopes = await client.GetScopesAsync(CurrentFrameId);
+            var variables = new List<Variable>();
+            foreach (var scope in scopes.Where(s => s.VariablesReference > 0 && !s.Expensive))
             {
-                return (false, [], "No active debug session.");
+                variables.AddRange(await client.GetVariablesAsync(scope.VariablesReference));
             }
 
-            if (!IsPaused)
-            {
-                return (false, [], "Program is not paused.");
-            }
-
-            var scopes = await _dapClient.GetScopesAsync(CurrentFrameId);
-            var localScope = scopes.FirstOrDefault(s => s.Name.Equals("Locals", StringComparison.OrdinalIgnoreCase));
-
-            if (localScope == null)
-            {
-                return (true, [], "No local variables.");
-            }
-
-            var variables = await _dapClient.GetVariablesAsync(localScope.VariablesReference);
-            return (true, variables, $"Retrieved {variables.Length} local variables.");
+            return (true, [.. variables], $"Retrieved {variables.Count} local variables.");
         }
         catch (Exception ex)
         {
@@ -523,53 +730,63 @@ public class DebugSession
     }
 
     /// <summary>
-    /// Stops the current debug session.
+    /// Returns the last lines of program/debugger output.
     /// </summary>
-    public async Task<(bool Success, string Message)> StopAsync()
+    public string[] GetRecentOutput(int maxLines)
     {
-        try
+        lock (_lock)
         {
-            if (!IsActive)
-            {
-                return (false, "No active debug session.");
-            }
-
-            await _dapClient.DisconnectAsync(terminateDebuggee: true);
-            await _dapClient.DisposeAsync();
-
-            lock (_lock)
-            {
-                IsActive = false;
-                IsPaused = false;
-                CurrentThreadId = 0;
-                CurrentFrameId = 0;
-                StopReason = null;
-                _debuggedProcess = null;
-            }
-
-            return (true, "Debug session stopped.");
-        }
-        catch (Exception ex)
-        {
-            return (false, $"Failed to stop debug session: {ex.Message}");
+            return OutputMessages.Skip(Math.Max(0, OutputMessages.Count - maxLines)).ToArray();
         }
     }
 
     /// <summary>
-    /// Takes a screenshot of the debugged application's main window.
+    /// Stops the current debug session.
     /// </summary>
-    /// <returns>Base64-encoded image data.</returns>
-    public async Task<(bool Success, string ImageData, string Message)> TakeScreenshotAsync()
+    public async Task<(bool Success, string Message)> StopAsync()
     {
-        if (!IsActive)
+        if (_dapClient == null)
         {
-            return (false, string.Empty, "No active debug session.");
+            return (false, "No active debug session.");
         }
 
-        // Try to find the debugged process if not already set
-        if (_debuggedProcess == null)
+        // A process we attached to keeps running; one we launched is terminated
+        var detach = _attached;
+        await TearDownAsync(terminateDebuggee: !detach);
+        return (true, detach ? "Detached; the process keeps running." : "Debug session stopped.");
+    }
+
+    private async Task TearDownAsync(bool terminateDebuggee)
+    {
+        DapClient? client;
+        lock (_lock)
         {
-            await TryFindDebuggedProcessAsync();
+            client = _dapClient;
+            _dapClient = null;
+            IsActive = false;
+            MarkRunning();
+            _stopSignal.TrySetException(new InvalidOperationException("Session ended"));
+            _debuggedProcess = null;
+        }
+
+        if (client != null)
+        {
+            if (client.IsConnected)
+            {
+                await client.DisconnectAsync(terminateDebuggee);
+            }
+            await client.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Takes a screenshot of the debugged application's main window (PNG, base64).
+    /// </summary>
+    public async Task<(bool Success, string ImageData, string Message)> TakeScreenshotAsync()
+    {
+        if (!EnsureProcessSet())
+        {
+            return (false, string.Empty, "No debugged process to capture. Start a session or call ui_set_process_id.");
         }
 
         return await _uiService.TakeScreenshotAsync();
@@ -578,286 +795,276 @@ public class DebugSession
     /// <summary>
     /// Gets the UI control tree of the debugged application as XML.
     /// </summary>
-    /// <param name="maxDepth">Maximum depth to traverse the control tree.</param>
-    /// <returns>XML representation of the UI controls.</returns>
     public async Task<(bool Success, string Xml, string Message)> GetUiControlsAsync(int maxDepth = 10)
     {
-        if (!IsActive)
+        if (!EnsureProcessSet())
         {
-            return (false, string.Empty, "No active debug session.");
+            return (false, string.Empty, "No debugged process to inspect. Start a session or call ui_set_process_id.");
         }
 
-        // Try to find the debugged process if not already set
-        if (_debuggedProcess == null)
-        {
-            await TryFindDebuggedProcessAsync();
-        }
-
-        // Try enhanced API first, fallback to standard
-        var enhancedResult = await _uiService.GetControlsEnhancedAsync();
-        return enhancedResult;
+        return await _uiService.GetControlsEnhancedAsync(maxDepth);
     }
 
     /// <summary>
     /// Sets the process ID of the debugged application for UI automation.
     /// </summary>
-    public void SetDebuggedProcessId(int processId)
+    public bool SetDebuggedProcessId(int processId)
     {
         try
         {
-            _debuggedProcess = Process.GetProcessById(processId);
-            _uiService.SetTargetProcess(_debuggedProcess);
+            var process = Process.GetProcessById(processId);
+            lock (_lock)
+            {
+                _debuggedProcess = process;
+            }
+            _uiService.SetTargetProcess(process);
+            return true;
         }
         catch (Exception)
         {
-            _debuggedProcess = null;
+            return false;
         }
     }
 
     #region UI Interaction Methods
 
-    /// <summary>
-    /// Clicks on a control by its handle.
-    /// </summary>
     public async Task<(bool Success, string Message)> ClickControlAsync(long handle)
     {
-        await EnsureProcessSetAsync();
+        EnsureProcessSet();
         return await _uiService.ClickControlAsync(new IntPtr(handle));
     }
 
-    /// <summary>
-    /// Clicks at the specified screen coordinates.
-    /// </summary>
-    public async Task<(bool Success, string Message)> ClickAtAsync(int x, int y, string button = "left", int clickCount = 1)
+    public async Task<(bool Success, string Message)> ClickAtAsync(int x, int y, string button = "left", int clickCount = 1, bool screenCoordinates = false)
     {
-        await EnsureProcessSetAsync();
-        return await _uiService.ClickAtAsync(x, y, button, clickCount);
+        if (!EnsureProcessSet())
+        {
+            return (false, "No debugged process to click in.");
+        }
+
+        if (IsPaused)
+        {
+            return (false, "The program is paused in the debugger, so its UI cannot react. Continue first (debug_continue).");
+        }
+
+        return await _uiService.ClickAtAsync(x, y, button, clickCount, screenCoordinates);
     }
 
-    /// <summary>
-    /// Types text into the currently focused control or specified control.
-    /// </summary>
     public async Task<(bool Success, string Message)> TypeTextAsync(string text, long? handle = null)
     {
-        await EnsureProcessSetAsync();
+        EnsureProcessSet();
         IntPtr? handlePtr = handle.HasValue ? new IntPtr(handle.Value) : null;
         return await _uiService.TypeTextAsync(text, handlePtr);
     }
 
-    /// <summary>
-    /// Sends keyboard keys (including special keys like Enter, Tab, Ctrl+C, etc.).
-    /// </summary>
     public async Task<(bool Success, string Message)> SendKeysAsync(string keys)
     {
-        await EnsureProcessSetAsync();
+        EnsureProcessSet();
         return await _uiService.SendKeysAsync(keys);
     }
 
-    /// <summary>
-    /// Moves the mouse to the specified screen coordinates.
-    /// </summary>
-    public async Task<(bool Success, string Message)> MouseMoveAsync(int x, int y)
+    public async Task<(bool Success, string Message)> MouseMoveAsync(int x, int y, bool screenCoordinates = false)
     {
-        await EnsureProcessSetAsync();
-        return await _uiService.MouseMoveAsync(x, y);
+        EnsureProcessSet();
+        return await _uiService.MouseMoveAsync(x, y, screenCoordinates);
     }
 
-    /// <summary>
-    /// Performs a mouse drag from one point to another.
-    /// </summary>
-    public async Task<(bool Success, string Message)> MouseDragAsync(int startX, int startY, int endX, int endY, string button = "left")
+    public async Task<(bool Success, string Message)> MouseDragAsync(int startX, int startY, int endX, int endY, string button = "left", bool screenCoordinates = false)
     {
-        await EnsureProcessSetAsync();
-        return await _uiService.MouseDragAsync(startX, startY, endX, endY, button);
+        EnsureProcessSet();
+        return await _uiService.MouseDragAsync(startX, startY, endX, endY, button, screenCoordinates);
     }
 
-    /// <summary>
-    /// Sets focus to a control by its handle.
-    /// </summary>
     public async Task<(bool Success, string Message)> FocusControlAsync(long handle)
     {
-        await EnsureProcessSetAsync();
+        EnsureProcessSet();
         return await _uiService.FocusControlAsync(new IntPtr(handle));
     }
 
-    /// <summary>
-    /// Scrolls the mouse wheel at the current or specified position.
-    /// </summary>
-    public async Task<(bool Success, string Message)> MouseScrollAsync(int delta, int? x = null, int? y = null)
+    public async Task<(bool Success, string Message)> MouseScrollAsync(int delta, int? x = null, int? y = null, bool screenCoordinates = false)
     {
-        await EnsureProcessSetAsync();
-        return await _uiService.MouseScrollAsync(delta, x, y);
+        EnsureProcessSet();
+        return await _uiService.MouseScrollAsync(delta, x, y, screenCoordinates);
     }
 
-    /// <summary>
-    /// Finds a control by text and returns its handle.
-    /// </summary>
     public async Task<(bool Success, long Handle, string Message)> FindControlByTextAsync(string text, bool exactMatch = false)
     {
-        await EnsureProcessSetAsync();
+        EnsureProcessSet();
         var (success, handle, message) = await _uiService.FindControlByTextAsync(text, exactMatch);
         return (success, handle.ToInt64(), message);
     }
 
     /// <summary>
-    /// Ensures the target process is set for UI operations.
+    /// Makes sure UI automation targets the debuggee (pid reported by the debugger).
     /// </summary>
-    private async Task EnsureProcessSetAsync()
+    private bool EnsureProcessSet()
     {
-        if (_debuggedProcess == null)
+        lock (_lock)
         {
-            await TryFindDebuggedProcessAsync();
+            if (_debuggedProcess != null)
+            {
+                try
+                {
+                    _debuggedProcess.Refresh();
+                    if (!_debuggedProcess.HasExited) return true;
+                }
+                catch
+                {
+                    // Fall through to re-resolve
+                }
+            }
         }
+
+        return ProcessId is { } pid && SetDebuggedProcessId(pid);
     }
 
     #endregion
 
     /// <summary>
-    /// Tries to find the debugged process by looking for processes started after the debug session began.
+    /// Lists .NET processes that can be attached to.
     /// </summary>
-    private async Task TryFindDebuggedProcessAsync()
+    public (bool Success, List<ProcessInfo> Processes, string Message) ListDebuggableProcesses(string? filter = null)
     {
-        if (string.IsNullOrEmpty(ProgramPath))
-        {
-            return;
-        }
-
         try
         {
-            var programName = Path.GetFileNameWithoutExtension(ProgramPath);
-
-            // Look for processes with matching name
-            var processes = Process.GetProcessesByName(programName);
-            if (processes.Length > 0)
+            var processes = ProcessLaunchManager.FindDebuggableProcesses(filter);
+            var message = $"Found {processes.Count} debuggable process{(processes.Count == 1 ? "" : "es")}";
+            if (!string.IsNullOrEmpty(filter))
             {
-                // Use the most recently started one
-                _debuggedProcess = processes.OrderByDescending(p =>
-                {
-                    try { return p.StartTime; }
-                    catch { return DateTime.MinValue; }
-                }).FirstOrDefault();
-
-                if (_debuggedProcess != null)
-                {
-                    _uiService.SetTargetProcess(_debuggedProcess);
-                }
+                message += $" matching '{filter}'";
             }
 
-            // Also try "dotnet" processes that might be running our DLL
-            if (_debuggedProcess == null)
-            {
-                var dotnetProcesses = Process.GetProcessesByName("dotnet");
-                foreach (var proc in dotnetProcesses)
-                {
-                    try
-                    {
-                        // Check if command line contains our program
-                        // This is a heuristic and may not always work
-                        _debuggedProcess = proc;
-                        _uiService.SetTargetProcess(_debuggedProcess);
-                        break;
-                    }
-                    catch
-                    {
-                        // Continue to next process
-                    }
-                }
-            }
+            return (true, processes, message);
         }
-        catch
+        catch (Exception ex)
         {
-            // Ignore errors in process discovery
-        }
-
-        await Task.CompletedTask;
-    }
-
-    /// <summary>
-    /// Updates the session state - used by EnhancedDebugSession for VsDbg integration.
-    /// </summary>
-    internal void UpdateSessionState(bool isActive, string? programPath = null, bool isPaused = false)
-    {
-        lock (_lock)
-        {
-            IsActive = isActive;
-            if (programPath != null)
-            {
-                ProgramPath = programPath;
-            }
-            IsPaused = isPaused;
+            return (false, [], $"Failed to list processes: {ex.Message}");
         }
     }
 
-    private void HandleStopped(StoppedEventBody body)
+    private void StartWpfHelperProbe()
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(2000);
+                if (await _uiService.CheckWpfHelperAsync())
+                {
+                    DebugLogger.Log("WPF Helper API detected - Enhanced UI automation available");
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLogger.LogDebug($"Error checking WPF Helper API: {ex.Message}");
+            }
+        });
+    }
+
+    private void MarkRunning()
+    {
+        IsPaused = false;
+        CurrentLocation = null;
+        StopReason = null;
+        if (_stopSignal.Task.IsCompleted)
+        {
+            _stopSignal = NewStopSignal();
+        }
+    }
+
+    private void HandleStopped(DapClient client, StoppedEventBody body)
     {
         lock (_lock)
         {
+            if (_dapClient != client) return;
             IsPaused = true;
             CurrentThreadId = body.ThreadId;
             StopReason = body.Reason;
         }
 
-        // Get the current frame
-        Task.Run(async () =>
+        // Fetch the top frame off the receive loop, then publish the stop
+        _ = Task.Run(async () =>
         {
+            Dap.StackFrame? top = null;
             try
             {
-                var frames = await _dapClient.GetStackTraceAsync(body.ThreadId, 0, 1);
-                if (frames.Length > 0)
-                {
-                    lock (_lock)
-                    {
-                        CurrentFrameId = frames[0].Id;
-                    }
-                }
-
-                OnDebugEvent?.Invoke("stopped", new
-                {
-                    reason = body.Reason,
-                    threadId = body.ThreadId,
-                    description = body.Description,
-                    location = frames.Length > 0 ? new
-                    {
-                        file = frames[0].Source?.Path,
-                        line = frames[0].Line,
-                        function = frames[0].Name
-                    } : null
-                });
+                var frames = await client.GetStackTraceAsync(body.ThreadId, 0, 1);
+                top = frames.FirstOrDefault();
             }
-            catch
+            catch (Exception ex)
             {
-                // Ignore errors getting frame info
+                DebugLogger.LogDebug($"Could not read stack after stop: {ex.Message}");
             }
+
+            var location = new StopLocation(body.Reason, body.ThreadId, body.Description, top?.Name, top?.Source?.Path, top?.Line ?? 0);
+            lock (_lock)
+            {
+                if (_dapClient != client || !IsPaused) return;
+                CurrentFrameId = top?.Id ?? 0;
+                CurrentLocation = location;
+                _stopSignal.TrySetResult(location);
+            }
+
+            OnDebugEvent?.Invoke("stopped", location);
         });
+    }
+
+    private void HandleContinued(DapClient client)
+    {
+        lock (_lock)
+        {
+            if (_dapClient == client) MarkRunning();
+        }
+    }
+
+    private void HandleBreakpointChanged(Breakpoint breakpoint)
+    {
+        lock (_lock)
+        {
+            var entry = _breakpoints.Values.SelectMany(list => list).FirstOrDefault(b => b.Id == breakpoint.Id);
+            if (entry == null) return;
+            entry.Verified = breakpoint.Verified;
+            entry.ActualLine = breakpoint.Line > 0 ? breakpoint.Line : entry.ActualLine;
+            entry.Message = breakpoint.Message;
+        }
     }
 
     private void HandleOutput(OutputEventBody body)
     {
         lock (_lock)
         {
-            OutputMessages.Add($"[{body.Category}] {body.Output}");
+            OutputMessages.Add($"[{body.Category}] {body.Output.TrimEnd('\r', '\n')}");
+            if (OutputMessages.Count > MaxOutputMessages)
+            {
+                OutputMessages.RemoveRange(0, OutputMessages.Count - MaxOutputMessages);
+            }
         }
 
-        OnDebugEvent?.Invoke("output", new
-        {
-            category = body.Category,
-            output = body.Output
-        });
+        OnDebugEvent?.Invoke("output", body);
     }
 
-    private void HandleTerminated(TerminatedEventBody body)
+    private void HandleTerminated(DapClient client, TerminatedEventBody body)
     {
         lock (_lock)
         {
+            if (_dapClient != client) return;
             IsActive = false;
-            IsPaused = false;
+            MarkRunning();
+            _stopSignal.TrySetException(new InvalidOperationException("Program terminated"));
         }
 
-        OnDebugEvent?.Invoke("terminated", new { restart = body.Restart });
+        OnDebugEvent?.Invoke("terminated", body);
+
+        // Release netcoredbg; the session object stays usable for a new launch
+        _ = Task.Run(async () =>
+        {
+            lock (_lock)
+            {
+                if (_dapClient == client) _dapClient = null;
+            }
+            await client.DisposeAsync();
+        });
     }
 
-    private void HandleInitialized()
-    {
-        OnDebugEvent?.Invoke("initialized", null);
-    }
+    private static TaskCompletionSource<StopLocation> NewStopSignal()
+        => new(TaskCreationOptions.RunContinuationsAsynchronously);
 }

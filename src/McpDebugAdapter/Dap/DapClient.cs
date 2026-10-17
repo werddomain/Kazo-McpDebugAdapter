@@ -1,5 +1,6 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -7,24 +8,36 @@ using System.Text.Json.Nodes;
 namespace McpDebugAdapter.Dap;
 
 /// <summary>
-/// DAP Client that communicates with netcoredbg via TCP socket.
+/// DAP client that drives netcoredbg (Samsung, MIT licensed) over its stdin/stdout.
 /// Handles launching the debugger process, sending requests, and receiving events.
 /// </summary>
 public class DapClient : IAsyncDisposable
 {
-    private Process? _netcoredbgProcess;
-    private TcpClient? _tcpClient;
-    private NetworkStream? _stream;
+    private static readonly JsonSerializerOptions SerializerOptions = new()
+    {
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+    };
+
+    private Process? _debuggerProcess;
+    private Stream? _input;
+    private Stream? _output;
     private int _sequenceNumber;
-    private readonly Dictionary<int, TaskCompletionSource<DapResponse>> _pendingRequests = new();
+    private readonly ConcurrentDictionary<int, TaskCompletionSource<DapResponse>> _pendingRequests = new();
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly StringBuilder _stderr = new();
     private CancellationTokenSource? _cancellationTokenSource;
     private Task? _receiveTask;
-    private readonly object _lock = new();
+    private TaskCompletionSource _initializedEvent = NewSignal();
 
     /// <summary>
     /// Event fired when the debugger stops (breakpoint hit, step complete, etc.).
     /// </summary>
     public event Action<StoppedEventBody>? OnStopped;
+
+    /// <summary>
+    /// Event fired when the debuggee resumes execution.
+    /// </summary>
+    public event Action<int>? OnContinued;
 
     /// <summary>
     /// Event fired when debugger output is received.
@@ -37,153 +50,90 @@ public class DapClient : IAsyncDisposable
     public event Action<TerminatedEventBody>? OnTerminated;
 
     /// <summary>
+    /// Event fired when the debuggee exits.
+    /// </summary>
+    public event Action<int>? OnExited;
+
+    /// <summary>
     /// Event fired when the debugger is initialized.
     /// </summary>
     public event Action? OnInitialized;
 
     /// <summary>
-    /// Event fired when configuration is done.
+    /// Event fired when the debugger reports the debuggee process (carries its OS process id).
     /// </summary>
-    public event Action? OnConfigurationDone;
+    public event Action<int>? OnProcess;
+
+    /// <summary>
+    /// Event fired when a breakpoint changes state (e.g. a pending breakpoint gets bound).
+    /// </summary>
+    public event Action<Breakpoint>? OnBreakpointChanged;
 
     /// <summary>
     /// Indicates whether the client is currently connected to the debugger.
     /// </summary>
-    public bool IsConnected => _tcpClient?.Connected == true;
+    public bool IsConnected => _input != null && _debuggerProcess is { HasExited: false };
 
     /// <summary>
-    /// Path to the netcoredbg executable.
+    /// Path to the netcoredbg executable. Resolved automatically when not set.
     /// </summary>
-    public string NetCoreDbgPath { get; set; } = "netcoredbg";
+    public string? NetCoreDbgPath { get; set; }
 
     /// <summary>
-    /// Starts the netcoredbg process and connects to it via TCP.
+    /// Timeout applied to each DAP request.
     /// </summary>
-    /// <param name="port">The TCP port to use for communication.</param>
-    /// <param name="cancellationToken">Cancellation token.</param>
-    public async Task StartAsync(int port = 0, CancellationToken cancellationToken = default)
+    public TimeSpan RequestTimeout { get; set; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// Starts the netcoredbg process and talks to it via stdin/stdout.
+    /// </summary>
+    public async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        if (port == 0)
-        {
-            port = GetAvailablePort();
-        }
+        var path = NetCoreDbgLocator.Resolve(NetCoreDbgPath)
+            ?? throw new InvalidOperationException(NetCoreDbgLocator.NotFoundMessage);
 
         _cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _initializedEvent = NewSignal();
 
-        // Start netcoredbg process
         var startInfo = new ProcessStartInfo
         {
-            FileName = NetCoreDbgPath,
-            Arguments = $"--interpreter=vscode --server={port}",
+            FileName = path,
+            Arguments = "--interpreter=vscode",
             UseShellExecute = false,
+            RedirectStandardInput = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             CreateNoWindow = true
         };
 
-        _netcoredbgProcess = new Process { StartInfo = startInfo };
-
-        _netcoredbgProcess.OutputDataReceived += (sender, e) =>
+        _debuggerProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
+        _debuggerProcess.ErrorDataReceived += (_, e) =>
         {
-            if (!string.IsNullOrEmpty(e.Data))
+            if (string.IsNullOrEmpty(e.Data)) return;
+            DebugLogger.LogDebug($"netcoredbg stderr: {e.Data}");
+            lock (_stderr)
             {
-                DebugLogger.LogDebug($"netcoredbg stdout: {e.Data}");
-                OnOutput?.Invoke(new OutputEventBody { Category = "stdout", Output = e.Data + "\n" });
-            }
-        };
-
-        _netcoredbgProcess.ErrorDataReceived += (sender, e) =>
-        {
-            if (!string.IsNullOrEmpty(e.Data))
-            {
-                DebugLogger.LogDebug($"netcoredbg stderr: {e.Data}");
-                OnOutput?.Invoke(new OutputEventBody { Category = "stderr", Output = e.Data + "\n" });
+                if (_stderr.Length < 8192) _stderr.AppendLine(e.Data);
             }
         };
 
         try
         {
-            DebugLogger.LogDebug($"Starting netcoredbg: {NetCoreDbgPath} {startInfo.Arguments}");
-            _netcoredbgProcess.Start();
-            _netcoredbgProcess.BeginOutputReadLine();
-            _netcoredbgProcess.BeginErrorReadLine();
-            
-            DebugLogger.LogDebug($"netcoredbg process started with PID: {_netcoredbgProcess.Id}");
+            DebugLogger.LogDebug($"Starting netcoredbg: {path} {startInfo.Arguments}");
+            _debuggerProcess.Start();
+            _debuggerProcess.BeginErrorReadLine();
+            DebugLogger.LogDebug($"netcoredbg process started with PID: {_debuggerProcess.Id}");
         }
         catch (Exception ex)
         {
-            throw new InvalidOperationException($"Failed to start netcoredbg process. Make sure netcoredbg is installed and in PATH. Error: {ex.Message}", ex);
+            throw new InvalidOperationException($"Failed to start netcoredbg at '{path}': {ex.Message}", ex);
         }
 
-        // Wait a bit for the server to start
-        await Task.Delay(500, cancellationToken);
-        
-        // Check if process exited early
-        if (_netcoredbgProcess.HasExited)
-        {
-            var exitCode = _netcoredbgProcess.ExitCode;
-            var errorMessage = $"netcoredbg process exited immediately with code {exitCode}.";
-            
-            if (exitCode == -1073741515) // 0xC0000135 - DLL not found
-            {
-                errorMessage += " This usually means .NET Core runtime is not installed or netcoredbg is not compatible with your system.";
-            }
-            else if (exitCode != 0)
-            {
-                errorMessage += " Check if netcoredbg is compatible with your system and .NET version.";
-            }
-            
-            throw new InvalidOperationException(errorMessage);
-        }
+        _input = _debuggerProcess.StandardInput.BaseStream;
+        _output = _debuggerProcess.StandardOutput.BaseStream;
+        _receiveTask = Task.Run(() => ReceiveLoopAsync(_cancellationTokenSource.Token));
 
-        // Connect via TCP
-        _tcpClient = new TcpClient();
-
-        var connectAttempts = 0;
-        const int maxAttempts = 10;
-        Exception? lastException = null;
-
-        DebugLogger.LogDebug($"Attempting to connect to netcoredbg on port {port}...");
-        
-        while (connectAttempts < maxAttempts)
-        {
-            try
-            {
-                await _tcpClient.ConnectAsync("127.0.0.1", port, cancellationToken);
-                break;
-            }
-            catch (SocketException ex) when (connectAttempts < maxAttempts - 1)
-            {
-                lastException = ex;
-                connectAttempts++;
-                DebugLogger.LogDebug($"Connection attempt {connectAttempts}/{maxAttempts} failed: {ex.Message}");
-                await Task.Delay(200, cancellationToken);
-            }
-        }
-
-        if (!_tcpClient.Connected)
-        {
-            var errorMsg = $"Failed to connect to netcoredbg on port {port} after {maxAttempts} attempts.";
-            if (lastException != null)
-            {
-                errorMsg += $" Last error: {lastException.Message}";
-            }
-            if (!_netcoredbgProcess.HasExited)
-            {
-                errorMsg += " The netcoredbg process is running but not accepting connections.";
-            }
-            else
-            {
-                errorMsg += $" The netcoredbg process exited with code {_netcoredbgProcess.ExitCode}.";
-            }
-            throw new InvalidOperationException(errorMsg);
-        }
-
-        _stream = _tcpClient.GetStream();
-        DebugLogger.LogDebug("Successfully connected to netcoredbg");
-
-        // Start the receive loop
-        _receiveTask = ReceiveLoopAsync(_cancellationTokenSource.Token);
+        await Task.CompletedTask;
     }
 
     /// <summary>
@@ -191,78 +141,53 @@ public class DapClient : IAsyncDisposable
     /// </summary>
     public async Task<Capabilities?> InitializeAsync(CancellationToken cancellationToken = default)
     {
-        try
-        {
-            DebugLogger.LogDebug("Sending initialize request to debugger...");
-            var args = new InitializeRequestArguments();
-            var response = await SendRequestAsync("initialize", args, cancellationToken);
-            
-            DebugLogger.LogDebug($"Initialize response - Success: {response.Success}");
-
-            if (response.Success && response.Body != null)
-            {
-                var json = JsonSerializer.Serialize(response.Body);
-                var capabilities = JsonSerializer.Deserialize<Capabilities>(json);
-                DebugLogger.LogDebug("Debugger initialization completed successfully");
-                return capabilities;
-            }
-
-            DebugLogger.LogError($"Initialize failed - Success: {response.Success}, Body: {response.Body}");
-            return null;
-        }
-        catch (Exception ex)
-        {
-            DebugLogger.LogError($"Exception during initialize: {ex.Message}", ex);
-            throw;
-        }
+        var response = await SendRequestAsync("initialize", new InitializeRequestArguments(), cancellationToken);
+        EnsureSuccess(response);
+        return response.Body == null ? new Capabilities() : Deserialize<Capabilities>(response.Body);
     }
 
     /// <summary>
-    /// Launches a program for debugging.
+    /// Sends the launch request. The response is awaited separately because some adapters
+    /// only answer it after configurationDone.
     /// </summary>
-    public async Task<bool> LaunchAsync(string program, string[]? args = null, string? cwd = null, bool stopAtEntry = false, CancellationToken cancellationToken = default)
-    {
-        try
-        {
-            DebugLogger.LogDebug($"Sending launch request for program: {program}");
-            var launchArgs = new LaunchRequestArguments
-            {
-                Program = program,
-                Args = args,
-                Cwd = cwd ?? Path.GetDirectoryName(program),
-                StopAtEntry = stopAtEntry
-            };
+    public Task<DapResponse> SendLaunchAsync(LaunchRequestArguments args, CancellationToken cancellationToken = default)
+        => SendRequestAsync("launch", args, cancellationToken);
 
-            var response = await SendRequestAsync("launch", launchArgs, cancellationToken);
-            DebugLogger.LogDebug($"Launch response - Success: {response.Success}");
-            
-            if (!response.Success)
-            {
-                DebugLogger.LogError($"Launch failed - Response: {JsonSerializer.Serialize(response)}");
-            }
-            
-            return response.Success;
-        }
-        catch (Exception ex)
-        {
-            DebugLogger.LogError($"Exception during launch: {ex.Message}", ex);
-            throw;
-        }
+    /// <summary>
+    /// Sends the attach request. The response is awaited separately (see <see cref="SendLaunchAsync"/>).
+    /// </summary>
+    public Task<DapResponse> SendAttachAsync(AttachRequestArguments args, CancellationToken cancellationToken = default)
+        => SendRequestAsync("attach", args, cancellationToken);
+
+    /// <summary>
+    /// Waits for the "initialized" event, after which breakpoints can be configured.
+    /// </summary>
+    public async Task WaitForInitializedAsync(TimeSpan timeout, CancellationToken cancellationToken = default)
+    {
+        await _initializedEvent.Task.WaitAsync(timeout, cancellationToken);
     }
 
     /// <summary>
     /// Signals that configuration is done and the program can start.
     /// </summary>
-    public async Task<bool> ConfigurationDoneAsync(CancellationToken cancellationToken = default)
+    public async Task ConfigurationDoneAsync(CancellationToken cancellationToken = default)
     {
-        var response = await SendRequestAsync("configurationDone", null, cancellationToken);
-        return response.Success;
+        EnsureSuccess(await SendRequestAsync("configurationDone", null, cancellationToken));
     }
 
     /// <summary>
-    /// Sets breakpoints in a source file.
+    /// Configures which exceptions break into the debugger.
     /// </summary>
-    public async Task<Breakpoint[]> SetBreakpointsAsync(string filePath, int[] lines, CancellationToken cancellationToken = default)
+    public async Task SetExceptionBreakpointsAsync(string[] filters, CancellationToken cancellationToken = default)
+    {
+        EnsureSuccess(await SendRequestAsync("setExceptionBreakpoints", new { filters }, cancellationToken));
+    }
+
+    /// <summary>
+    /// Sets breakpoints in a source file (replaces all breakpoints of that file).
+    /// The returned array has one entry per requested breakpoint, in the same order.
+    /// </summary>
+    public async Task<Breakpoint[]> SetBreakpointsAsync(string filePath, SourceBreakpoint[] breakpoints, CancellationToken cancellationToken = default)
     {
         var args = new SetBreakpointsArguments
         {
@@ -271,19 +196,12 @@ public class DapClient : IAsyncDisposable
                 Path = filePath,
                 Name = Path.GetFileName(filePath)
             },
-            Breakpoints = lines.Select(line => new SourceBreakpoint { Line = line }).ToArray()
+            Breakpoints = breakpoints
         };
 
         var response = await SendRequestAsync("setBreakpoints", args, cancellationToken);
-
-        if (response.Success && response.Body != null)
-        {
-            var json = JsonSerializer.Serialize(response.Body);
-            var body = JsonSerializer.Deserialize<SetBreakpointsResponseBody>(json);
-            return body?.Breakpoints ?? [];
-        }
-
-        return [];
+        EnsureSuccess(response);
+        return Deserialize<SetBreakpointsResponseBody>(response.Body)?.Breakpoints ?? [];
     }
 
     /// <summary>
@@ -292,15 +210,8 @@ public class DapClient : IAsyncDisposable
     public async Task<DapThread[]> GetThreadsAsync(CancellationToken cancellationToken = default)
     {
         var response = await SendRequestAsync("threads", null, cancellationToken);
-
-        if (response.Success && response.Body != null)
-        {
-            var json = JsonSerializer.Serialize(response.Body);
-            var body = JsonSerializer.Deserialize<ThreadsResponseBody>(json);
-            return body?.Threads ?? [];
-        }
-
-        return [];
+        EnsureSuccess(response);
+        return Deserialize<ThreadsResponseBody>(response.Body)?.Threads ?? [];
     }
 
     /// <summary>
@@ -316,15 +227,8 @@ public class DapClient : IAsyncDisposable
         };
 
         var response = await SendRequestAsync("stackTrace", args, cancellationToken);
-
-        if (response.Success && response.Body != null)
-        {
-            var json = JsonSerializer.Serialize(response.Body);
-            var body = JsonSerializer.Deserialize<StackTraceResponseBody>(json);
-            return body?.StackFrames ?? [];
-        }
-
-        return [];
+        EnsureSuccess(response);
+        return Deserialize<StackTraceResponseBody>(response.Body)?.StackFrames ?? [];
     }
 
     /// <summary>
@@ -332,41 +236,25 @@ public class DapClient : IAsyncDisposable
     /// </summary>
     public async Task<Scope[]> GetScopesAsync(int frameId, CancellationToken cancellationToken = default)
     {
-        var args = new ScopesArguments { FrameId = frameId };
-        var response = await SendRequestAsync("scopes", args, cancellationToken);
-
-        if (response.Success && response.Body != null)
-        {
-            var json = JsonSerializer.Serialize(response.Body);
-            var body = JsonSerializer.Deserialize<ScopesResponseBody>(json);
-            return body?.Scopes ?? [];
-        }
-
-        return [];
+        var response = await SendRequestAsync("scopes", new ScopesArguments { FrameId = frameId }, cancellationToken);
+        EnsureSuccess(response);
+        return Deserialize<ScopesResponseBody>(response.Body)?.Scopes ?? [];
     }
 
     /// <summary>
-    /// Gets variables for a scope.
+    /// Gets variables for a scope or a structured variable.
     /// </summary>
     public async Task<Variable[]> GetVariablesAsync(int variablesReference, CancellationToken cancellationToken = default)
     {
-        var args = new VariablesArguments { VariablesReference = variablesReference };
-        var response = await SendRequestAsync("variables", args, cancellationToken);
-
-        if (response.Success && response.Body != null)
-        {
-            var json = JsonSerializer.Serialize(response.Body);
-            var body = JsonSerializer.Deserialize<VariablesResponseBody>(json);
-            return body?.Variables ?? [];
-        }
-
-        return [];
+        var response = await SendRequestAsync("variables", new VariablesArguments { VariablesReference = variablesReference }, cancellationToken);
+        EnsureSuccess(response);
+        return Deserialize<VariablesResponseBody>(response.Body)?.Variables ?? [];
     }
 
     /// <summary>
     /// Evaluates an expression in the context of a stack frame.
     /// </summary>
-    public async Task<EvaluateResponseBody?> EvaluateAsync(string expression, int frameId, string context = "repl", CancellationToken cancellationToken = default)
+    public async Task<EvaluateResponseBody> EvaluateAsync(string expression, int frameId, string context = "repl", CancellationToken cancellationToken = default)
     {
         var args = new EvaluateArguments
         {
@@ -376,44 +264,48 @@ public class DapClient : IAsyncDisposable
         };
 
         var response = await SendRequestAsync("evaluate", args, cancellationToken);
-
-        if (response.Success && response.Body != null)
-        {
-            var json = JsonSerializer.Serialize(response.Body);
-            return JsonSerializer.Deserialize<EvaluateResponseBody>(json);
-        }
-
-        return null;
+        EnsureSuccess(response);
+        return Deserialize<EvaluateResponseBody>(response.Body) ?? new EvaluateResponseBody();
     }
 
     /// <summary>
-    /// Continues execution of a thread.
+    /// Continues execution.
     /// </summary>
-    public async Task<bool> ContinueAsync(int threadId, CancellationToken cancellationToken = default)
+    public async Task ContinueAsync(int threadId, CancellationToken cancellationToken = default)
     {
-        var args = new ContinueArguments { ThreadId = threadId };
-        var response = await SendRequestAsync("continue", args, cancellationToken);
-        return response.Success;
+        EnsureSuccess(await SendRequestAsync("continue", new ContinueArguments { ThreadId = threadId }, cancellationToken));
+    }
+
+    /// <summary>
+    /// Pauses execution.
+    /// </summary>
+    public async Task PauseAsync(int threadId, CancellationToken cancellationToken = default)
+    {
+        EnsureSuccess(await SendRequestAsync("pause", new { threadId }, cancellationToken));
     }
 
     /// <summary>
     /// Steps over the next line (Step Over).
     /// </summary>
-    public async Task<bool> NextAsync(int threadId, CancellationToken cancellationToken = default)
+    public async Task NextAsync(int threadId, CancellationToken cancellationToken = default)
     {
-        var args = new NextArguments { ThreadId = threadId };
-        var response = await SendRequestAsync("next", args, cancellationToken);
-        return response.Success;
+        EnsureSuccess(await SendRequestAsync("next", new NextArguments { ThreadId = threadId }, cancellationToken));
     }
 
     /// <summary>
     /// Steps into the next function call (Step In).
     /// </summary>
-    public async Task<bool> StepInAsync(int threadId, CancellationToken cancellationToken = default)
+    public async Task StepInAsync(int threadId, CancellationToken cancellationToken = default)
     {
-        var args = new StepInArguments { ThreadId = threadId };
-        var response = await SendRequestAsync("stepIn", args, cancellationToken);
-        return response.Success;
+        EnsureSuccess(await SendRequestAsync("stepIn", new StepInArguments { ThreadId = threadId }, cancellationToken));
+    }
+
+    /// <summary>
+    /// Steps out of the current function (Step Out).
+    /// </summary>
+    public async Task StepOutAsync(int threadId, CancellationToken cancellationToken = default)
+    {
+        EnsureSuccess(await SendRequestAsync("stepOut", new { threadId }, cancellationToken));
     }
 
     /// <summary>
@@ -423,8 +315,9 @@ public class DapClient : IAsyncDisposable
     {
         try
         {
-            var args = new { terminateDebuggee };
-            await SendRequestAsync("disconnect", args, cancellationToken);
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(TimeSpan.FromSeconds(5));
+            await SendRequestAsync("disconnect", new { terminateDebuggee }, cts.Token);
         }
         catch
         {
@@ -432,22 +325,56 @@ public class DapClient : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Returns what netcoredbg wrote to stderr so far (useful in error messages).
+    /// </summary>
+    public string GetDebuggerStderr()
+    {
+        lock (_stderr)
+        {
+            return _stderr.ToString().Trim();
+        }
+    }
+
+    /// <summary>
+    /// Throws an exception carrying the adapter's error message when a response failed.
+    /// </summary>
+    public static void EnsureSuccess(DapResponse response)
+    {
+        if (response.Success) return;
+        throw new DapRequestException(response.Command, DescribeError(response));
+    }
+
+    private static string DescribeError(DapResponse response)
+    {
+        // DAP puts a short id in "message" and the readable text in body.error.format
+        string? format = null;
+        if (response.Body is JsonElement body && body.ValueKind == JsonValueKind.Object &&
+            body.TryGetProperty("error", out var error) && error.ValueKind == JsonValueKind.Object &&
+            error.TryGetProperty("format", out var formatElement))
+        {
+            format = formatElement.GetString();
+        }
+
+        return format ?? response.Message ?? "unknown error";
+    }
+
     private async Task<DapResponse> SendRequestAsync(string command, object? arguments, CancellationToken cancellationToken)
     {
-        if (_stream == null)
+        if (_input == null || _debuggerProcess == null)
         {
             throw new InvalidOperationException("Not connected to debugger");
         }
 
-        int seq;
-        TaskCompletionSource<DapResponse> tcs;
-
-        lock (_lock)
+        if (_debuggerProcess.HasExited)
         {
-            seq = ++_sequenceNumber;
-            tcs = new TaskCompletionSource<DapResponse>();
-            _pendingRequests[seq] = tcs;
+            throw new InvalidOperationException(DescribeDebuggerExit());
         }
+
+        var seq = Interlocked.Increment(ref _sequenceNumber);
+        // Continuations must not run on the receive loop, or a handler awaiting another response would stall it
+        var tcs = new TaskCompletionSource<DapResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pendingRequests[seq] = tcs;
 
         var request = new DapRequest
         {
@@ -456,121 +383,96 @@ public class DapClient : IAsyncDisposable
             Arguments = arguments
         };
 
-        var json = JsonSerializer.Serialize(request, new JsonSerializerOptions
-        {
-            DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
-        });
-
-        var content = Encoding.UTF8.GetBytes(json);
-        var header = Encoding.UTF8.GetBytes($"Content-Length: {content.Length}\r\n\r\n");
-
-        await _stream.WriteAsync(header, cancellationToken);
-        await _stream.WriteAsync(content, cancellationToken);
-        await _stream.FlushAsync(cancellationToken);
-
-        // Wait for response with timeout
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        cts.CancelAfter(TimeSpan.FromSeconds(60));
-
         try
         {
+            await WriteMessageAsync(JsonSerializer.Serialize(request, SerializerOptions), cancellationToken);
+
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(RequestTimeout);
             return await tcs.Task.WaitAsync(cts.Token);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            lock (_lock)
-            {
-                _pendingRequests.Remove(seq);
-            }
-            throw;
+            throw new TimeoutException($"netcoredbg did not answer '{command}' within {RequestTimeout.TotalSeconds:0}s.");
+        }
+        finally
+        {
+            _pendingRequests.TryRemove(seq, out _);
+        }
+    }
+
+    private async Task WriteMessageAsync(string json, CancellationToken cancellationToken)
+    {
+        DebugLogger.LogDebug($"DAP SEND: {json}");
+        // Content-Length counts bytes, not characters
+        var content = Encoding.UTF8.GetBytes(json);
+        var header = Encoding.ASCII.GetBytes($"Content-Length: {content.Length}\r\n\r\n");
+
+        await _writeLock.WaitAsync(cancellationToken);
+        try
+        {
+            await _input!.WriteAsync(header, cancellationToken);
+            await _input.WriteAsync(content, cancellationToken);
+            await _input.FlushAsync(cancellationToken);
+        }
+        finally
+        {
+            _writeLock.Release();
         }
     }
 
     private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
     {
-        var buffer = new byte[8192];
-        var messageBuffer = new StringBuilder();
+        var reader = new DapMessageReader(_output!);
 
-        while (!cancellationToken.IsCancellationRequested && _stream != null)
+        try
         {
-            try
+            while (!cancellationToken.IsCancellationRequested)
             {
-                var bytesRead = await _stream.ReadAsync(buffer, cancellationToken);
-                if (bytesRead == 0)
+                var message = await reader.ReadMessageAsync(cancellationToken);
+                if (message == null)
                 {
                     break;
                 }
 
-                messageBuffer.Append(Encoding.UTF8.GetString(buffer, 0, bytesRead));
-
-                // Process complete messages
-                while (TryParseMessage(messageBuffer, out var message))
-                {
-                    ProcessMessage(message);
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch (IOException)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                OnOutput?.Invoke(new OutputEventBody
-                {
-                    Category = "stderr",
-                    Output = $"Error receiving DAP message: {ex.Message}\n"
-                });
+                DebugLogger.LogDebug($"DAP RECV: {message}");
+                ProcessMessage(message);
             }
         }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.LogError($"DAP receive loop failed: {ex.Message}", ex);
+        }
+
+        // The debugger is gone: fail whatever is still waiting
+        var reason = new InvalidOperationException(DescribeDebuggerExit());
+        foreach (var pending in _pendingRequests.Values)
+        {
+            pending.TrySetException(reason);
+        }
+        _initializedEvent.TrySetException(reason);
     }
 
-    private static bool TryParseMessage(StringBuilder buffer, out string message)
+    private string DescribeDebuggerExit()
     {
-        message = string.Empty;
-        var content = buffer.ToString();
-
-        // Look for Content-Length header
-        var headerEnd = content.IndexOf("\r\n\r\n", StringComparison.Ordinal);
-        if (headerEnd < 0)
+        var message = "netcoredbg stopped responding";
+        try
         {
-            return false;
+            if (_debuggerProcess is { HasExited: true })
+            {
+                message = $"netcoredbg exited with code {_debuggerProcess.ExitCode}";
+            }
+        }
+        catch
+        {
+            // Process may be disposed
         }
 
-        var header = content[..headerEnd];
-        const string contentLengthPrefix = "Content-Length: ";
-
-        if (!header.StartsWith(contentLengthPrefix, StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        var lengthStr = header[contentLengthPrefix.Length..];
-        var newlineIndex = lengthStr.IndexOf('\r');
-        if (newlineIndex >= 0)
-        {
-            lengthStr = lengthStr[..newlineIndex];
-        }
-
-        if (!int.TryParse(lengthStr, out var contentLength))
-        {
-            return false;
-        }
-
-        var messageStart = headerEnd + 4;
-        var totalLength = messageStart + contentLength;
-
-        if (content.Length < totalLength)
-        {
-            return false;
-        }
-
-        message = content.Substring(messageStart, contentLength);
-        buffer.Remove(0, totalLength);
-        return true;
+        var stderr = GetDebuggerStderr();
+        return string.IsNullOrEmpty(stderr) ? message + "." : $"{message}: {stderr}";
     }
 
     private void ProcessMessage(string json)
@@ -580,104 +482,128 @@ public class DapClient : IAsyncDisposable
             var node = JsonNode.Parse(json);
             if (node == null) return;
 
-            var type = node["type"]?.GetValue<string>();
-
-            switch (type)
+            switch (node["type"]?.GetValue<string>())
             {
                 case "response":
-                    ProcessResponse(json);
+                    var response = JsonSerializer.Deserialize<DapResponse>(json);
+                    if (response != null && _pendingRequests.TryGetValue(response.RequestSeq, out var tcs))
+                    {
+                        tcs.TrySetResult(response);
+                    }
                     break;
                 case "event":
-                    ProcessEvent(json);
+                    ProcessEvent(node);
+                    break;
+                case "request":
+                    // Reverse request (e.g. runInTerminal): we advertise no support, so decline it
+                    _ = RejectReverseRequestAsync(node);
                     break;
             }
         }
         catch (Exception ex)
         {
-            OnOutput?.Invoke(new OutputEventBody
-            {
-                Category = "stderr",
-                Output = $"Error processing DAP message: {ex.Message}\n"
-            });
+            DebugLogger.LogError($"Error processing DAP message: {ex.Message}", ex);
         }
     }
 
-    private void ProcessResponse(string json)
+    private async Task RejectReverseRequestAsync(JsonNode request)
     {
-        var response = JsonSerializer.Deserialize<DapResponse>(json);
-        if (response == null) return;
-
-        lock (_lock)
+        var reply = new JsonObject
         {
-            if (_pendingRequests.TryGetValue(response.RequestSeq, out var tcs))
-            {
-                _pendingRequests.Remove(response.RequestSeq);
-                tcs.SetResult(response);
-            }
+            ["seq"] = Interlocked.Increment(ref _sequenceNumber),
+            ["type"] = "response",
+            ["request_seq"] = request["seq"]?.GetValue<int>() ?? 0,
+            ["command"] = request["command"]?.GetValue<string>() ?? string.Empty,
+            ["success"] = false,
+            ["message"] = "Not supported by MCP Debug Adapter"
+        };
+
+        try
+        {
+            await WriteMessageAsync(reply.ToJsonString(), CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            DebugLogger.LogDebug($"Could not answer reverse request: {ex.Message}");
         }
     }
 
-    private void ProcessEvent(string json)
+    private void ProcessEvent(JsonNode eventNode)
     {
-        var eventNode = JsonNode.Parse(json);
-        if (eventNode == null) return;
-
-        var eventName = eventNode["event"]?.GetValue<string>();
         var body = eventNode["body"];
 
-        switch (eventName)
+        switch (eventNode["event"]?.GetValue<string>())
         {
-            case "stopped":
-                if (body != null)
-                {
-                    var stoppedBody = JsonSerializer.Deserialize<StoppedEventBody>(body.ToJsonString());
-                    if (stoppedBody != null)
-                    {
-                        OnStopped?.Invoke(stoppedBody);
-                    }
-                }
-                break;
-
-            case "output":
-                if (body != null)
-                {
-                    var outputBody = JsonSerializer.Deserialize<OutputEventBody>(body.ToJsonString());
-                    if (outputBody != null)
-                    {
-                        OnOutput?.Invoke(outputBody);
-                    }
-                }
-                break;
-
-            case "terminated":
-                var terminatedBody = body != null
-                    ? JsonSerializer.Deserialize<TerminatedEventBody>(body.ToJsonString())
-                    : new TerminatedEventBody();
-                OnTerminated?.Invoke(terminatedBody ?? new TerminatedEventBody());
-                break;
-
             case "initialized":
+                _initializedEvent.TrySetResult();
                 OnInitialized?.Invoke();
                 break;
 
-            case "configurationDone":
-                OnConfigurationDone?.Invoke();
+            case "stopped":
+                var stopped = body?.Deserialize<StoppedEventBody>();
+                if (stopped != null) OnStopped?.Invoke(stopped);
+                break;
+
+            case "continued":
+                OnContinued?.Invoke(body?["threadId"]?.GetValue<int>() ?? 0);
+                break;
+
+            case "output":
+                var output = body?.Deserialize<OutputEventBody>();
+                if (output != null) OnOutput?.Invoke(output);
+                break;
+
+            case "breakpoint":
+                var breakpoint = body?["breakpoint"]?.Deserialize<Breakpoint>();
+                if (breakpoint != null) OnBreakpointChanged?.Invoke(breakpoint);
+                break;
+
+            case "process":
+                var pid = body?["systemProcessId"]?.GetValue<int>();
+                if (pid is > 0) OnProcess?.Invoke(pid.Value);
+                break;
+
+            case "exited":
+                OnExited?.Invoke(body?["exitCode"]?.GetValue<int>() ?? 0);
+                break;
+
+            case "terminated":
+                OnTerminated?.Invoke(body?.Deserialize<TerminatedEventBody>() ?? new TerminatedEventBody());
                 break;
         }
     }
 
-    private static int GetAvailablePort()
+    private static T? Deserialize<T>(object? body)
     {
-        using var listener = new TcpListener(System.Net.IPAddress.Loopback, 0);
-        listener.Start();
-        var port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
-        listener.Stop();
-        return port;
+        return body switch
+        {
+            null => default,
+            JsonElement element => element.Deserialize<T>(),
+            _ => JsonSerializer.Deserialize<T>(JsonSerializer.Serialize(body))
+        };
     }
+
+    private static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public async ValueTask DisposeAsync()
     {
         _cancellationTokenSource?.Cancel();
+
+        if (_debuggerProcess != null)
+        {
+            try
+            {
+                if (!_debuggerProcess.HasExited)
+                {
+                    _debuggerProcess.Kill(entireProcessTree: true);
+                    await _debuggerProcess.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5));
+                }
+            }
+            catch
+            {
+                // Ignore
+            }
+        }
 
         if (_receiveTask != null)
         {
@@ -691,25 +617,172 @@ public class DapClient : IAsyncDisposable
             }
         }
 
-        _stream?.Dispose();
-        _tcpClient?.Dispose();
-
-        if (_netcoredbgProcess != null && !_netcoredbgProcess.HasExited)
-        {
-            try
-            {
-                _netcoredbgProcess.Kill();
-                await _netcoredbgProcess.WaitForExitAsync();
-            }
-            catch
-            {
-                // Ignore
-            }
-        }
-
-        _netcoredbgProcess?.Dispose();
+        _debuggerProcess?.Dispose();
+        _debuggerProcess = null;
+        _input = null;
+        _output = null;
         _cancellationTokenSource?.Dispose();
 
         GC.SuppressFinalize(this);
+    }
+}
+
+/// <summary>
+/// Raised when the debug adapter answers a request with success = false.
+/// </summary>
+public class DapRequestException(string command, string message)
+    : Exception($"{command} failed: {message}")
+{
+    public string Command { get; } = command;
+}
+
+/// <summary>
+/// Reads Content-Length framed DAP messages. Lengths are in bytes, so the payload is
+/// decoded only once it is complete (multi-byte UTF-8 characters such as "é" are safe).
+/// </summary>
+public class DapMessageReader(Stream stream)
+{
+    private readonly byte[] _buffer = new byte[16384];
+    private int _start;
+    private int _end;
+
+    public async Task<string?> ReadMessageAsync(CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            var headerEnd = IndexOfHeaderEnd();
+            if (headerEnd >= 0)
+            {
+                var header = Encoding.ASCII.GetString(_buffer, _start, headerEnd - _start);
+                var contentLength = ParseContentLength(header);
+                _start = headerEnd + 4;
+
+                var content = new byte[contentLength];
+                var copied = 0;
+                while (copied < contentLength)
+                {
+                    if (_start == _end && !await FillAsync(cancellationToken))
+                    {
+                        return null;
+                    }
+
+                    var count = Math.Min(contentLength - copied, _end - _start);
+                    Buffer.BlockCopy(_buffer, _start, content, copied, count);
+                    _start += count;
+                    copied += count;
+                }
+
+                return Encoding.UTF8.GetString(content);
+            }
+
+            if (!await FillAsync(cancellationToken))
+            {
+                return null;
+            }
+        }
+    }
+
+    private static int ParseContentLength(string header)
+    {
+        foreach (var line in header.Split("\r\n"))
+        {
+            var colon = line.IndexOf(':');
+            if (colon > 0 && line[..colon].Trim().Equals("Content-Length", StringComparison.OrdinalIgnoreCase) &&
+                int.TryParse(line[(colon + 1)..].Trim(), out var length))
+            {
+                return length;
+            }
+        }
+
+        throw new InvalidDataException($"DAP header without Content-Length: {header}");
+    }
+
+    private int IndexOfHeaderEnd()
+    {
+        for (var i = _start; i + 3 < _end; i++)
+        {
+            if (_buffer[i] == '\r' && _buffer[i + 1] == '\n' && _buffer[i + 2] == '\r' && _buffer[i + 3] == '\n')
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private async Task<bool> FillAsync(CancellationToken cancellationToken)
+    {
+        if (_start > 0)
+        {
+            Buffer.BlockCopy(_buffer, _start, _buffer, 0, _end - _start);
+            _end -= _start;
+            _start = 0;
+        }
+
+        if (_end == _buffer.Length)
+        {
+            throw new InvalidDataException("DAP header too large");
+        }
+
+        var read = await stream.ReadAsync(_buffer.AsMemory(_end), cancellationToken);
+        if (read == 0)
+        {
+            return false;
+        }
+
+        _end += read;
+        return true;
+    }
+}
+
+/// <summary>
+/// Finds the netcoredbg executable.
+/// </summary>
+public static class NetCoreDbgLocator
+{
+    public const string NotFoundMessage =
+        "netcoredbg was not found. Download it from https://github.com/Samsung/netcoredbg/releases " +
+        "(netcoredbg-win64.zip on Windows), extract it, then either add its folder to PATH, " +
+        "set the NETCOREDBG_PATH environment variable to the executable, or pass netcoredbgPath to debug_launch.";
+
+    public static string? Resolve(string? explicitPath)
+    {
+        var exeName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "netcoredbg.exe" : "netcoredbg";
+
+        foreach (var candidate in Candidates(explicitPath, exeName))
+        {
+            if (string.IsNullOrWhiteSpace(candidate)) continue;
+
+            var path = candidate.Trim().Trim('"');
+            if (Directory.Exists(path))
+            {
+                path = Path.Combine(path, exeName);
+            }
+
+            if (File.Exists(path))
+            {
+                return Path.GetFullPath(path);
+            }
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<string?> Candidates(string? explicitPath, string exeName)
+    {
+        yield return explicitPath;
+        yield return Environment.GetEnvironmentVariable("NETCOREDBG_PATH");
+
+        // Shipped next to the adapter (e.g. <adapter folder>/netcoredbg/netcoredbg.exe)
+        yield return Path.Combine(AppContext.BaseDirectory, "netcoredbg", exeName);
+        yield return Path.Combine(AppContext.BaseDirectory, exeName);
+
+        foreach (var dir in (Environment.GetEnvironmentVariable("PATH") ?? string.Empty).Split(Path.PathSeparator))
+        {
+            if (!string.IsNullOrWhiteSpace(dir))
+            {
+                yield return Path.Combine(dir.Trim('"'), exeName);
+            }
+        }
     }
 }
